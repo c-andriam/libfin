@@ -1,0 +1,24 @@
+# .readthedocs.yml
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+
+# Required
+version: 2
+
+# Set the version of Python
+build:
+  os: ubuntu-20.04  # <- add this line
+  tools:
+    python: "3.10"
+
+# Configuration for Sphinx documentation
+sphinx:
+   configuration: docs/source/conf.py
+   fail_on_warning: true
+
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
