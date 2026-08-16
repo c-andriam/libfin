@@ -1,0 +1,191 @@
+# ============================================================================
+# 2D Link Fiat-to-Crypto Gateway — Podman Compose
+# ============================================================================
+# Usage:
+#   podman-compose up -d                       # Production (sans simulateur)
+#   podman-compose --profile dev up -d         # Dev (avec simulateur bancaire)
+#   podman-compose down -v                     # Tout arrêter + supprimer volumes
+# ============================================================================
+
+networks:
+  gateway-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  vaultdata:
+    driver: local
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — Transaction Database
+  # ──────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: gateway-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-gateway_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Redis — Celery Message Broker
+  # ──────────────────────────────────────────────────────────────────────────
+  redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: gateway-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # HashiCorp Vault — Secret Management
+  # ──────────────────────────────────────────────────────────────────────────
+  vault:
+    image: docker.io/hashicorp/vault:1.19
+    container_name: gateway-vault
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-dev-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    ports:
+      - "8200:8200"
+    volumes:
+      - vaultdata:/vault/data
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/v1/sys/health || exit 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Gateway API — FastAPI (Main Entry Point)
+  # ──────────────────────────────────────────────────────────────────────────
+  gateway-api:
+    build:
+      context: .
+      containerfile: Containerfile
+    image: gateway:latest
+    container_name: gateway-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway_dev_pass}@postgres:5432/${POSTGRES_DB:-gateway_db}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-dev-root-token}
+      WEB3_RPC_URL: ${WEB3_RPC_URL:-http://127.0.0.1:8545}
+      ERC20_TOKEN_ADDRESS: ${ERC20_TOKEN_ADDRESS:-0xdAC17F958D2ee523a2206206994597C13D831ec7}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-}
+      BANK_HOST: ${BANK_HOST:-bank-simulator}
+      BANK_PORT: ${BANK_PORT:-9000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Gateway Worker — Celery (Async Crypto Processing)
+  # ──────────────────────────────────────────────────────────────────────────
+  gateway-worker:
+    image: gateway:latest
+    container_name: gateway-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "gateway.worker.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway_dev_pass}@postgres:5432/${POSTGRES_DB:-gateway_db}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-dev-root-token}
+      WEB3_RPC_URL: ${WEB3_RPC_URL:-http://127.0.0.1:8545}
+      ERC20_TOKEN_ADDRESS: ${ERC20_TOKEN_ADDRESS:-0xdAC17F958D2ee523a2206206994597C13D831ec7}
+      BANK_HOST: ${BANK_HOST:-bank-simulator}
+      BANK_PORT: ${BANK_PORT:-9000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    networks:
+      - gateway-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Bank Simulator — DEV ONLY (Mock ISO8583 Network)
+  # ──────────────────────────────────────────────────────────────────────────
+  bank-simulator:
+    image: gateway:latest
+    container_name: gateway-bank-sim
+    profiles:
+      - dev
+    restart: unless-stopped
+    command: ["python", "tests/simulator/bank_server.py"]
+    volumes:
+      - ./tests/simulator:/app/tests/simulator:ro,z
+    networks:
+      - gateway-net
+    deploy:
+      resources:
+        limits:
+          memory: 128M

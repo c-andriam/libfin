@@ -48,12 +48,12 @@ install: ## Installer le package en mode développement
 	$(PIP) install -e ".[test,crypto]"
 
 .PHONY: install-all
-install-all: ## Installer avec toutes les dépendances (test + docs + crypto)
-	$(PIP) install -e ".[test,docs,crypto]"
+install-all: ## Installer avec toutes les dépendances (test + docs + crypto + gateway)
+	$(PIP) install -e ".[test,docs,crypto,gateway]"
 
 .PHONY: deps
 deps: ## Installer uniquement les dépendances (sans le package)
-	$(PIP) install flake8 pytest pytest-asyncio bump2version coverage cryptography python-dateutil
+	$(PIP) install flake8 pytest pytest-asyncio bump2version coverage cryptography python-dateutil fastapi uvicorn web3 pydantic httpx sqlalchemy asyncpg psycopg2-binary aiosqlite celery redis hvac
 
 # ──────────────────────────────────────────────────────────────
 #  Tests
@@ -195,21 +195,37 @@ clean-all: clean clean-build docs-clean ## Nettoyage complet (tout)
 	@echo "  ✔ Nettoyage complet effectué"
 
 # ──────────────────────────────────────────────────────────────
-#  Docker (optionnel)
+#  Infrastructure (Podman & Vault)
 # ──────────────────────────────────────────────────────────────
-.PHONY: docker-build
-docker-build: ## Construire l'image Docker
-	docker build -t $(PACKAGE):latest .
+.PHONY: infra-build
+infra-build: ## Construire l'image Podman du Gateway
+	podman build -t gateway:latest -f Containerfile .
 
-.PHONY: docker-test
-docker-test: docker-build ## Lancer les tests dans Docker
-	docker run --rm $(PACKAGE):latest pytest tests/ -v
+.PHONY: infra-up
+infra-up: ## Lancer les conteneurs de production
+	podman-compose up -d
+
+.PHONY: infra-dev
+infra-dev: ## Lancer les conteneurs (profil dev avec simulateur)
+	podman-compose --profile dev up -d
+
+.PHONY: infra-down
+infra-down: ## Arrêter et supprimer conteneurs et volumes
+	podman-compose down -v
+
+.PHONY: infra-vault
+infra-vault: ## Initialiser HashiCorp Vault (doit être exécuté après infra-up)
+	./scripts/vault_init.sh
+
+.PHONY: infra-logs
+infra-logs: ## Afficher les logs des conteneurs
+	podman-compose logs -f
 
 # ──────────────────────────────────────────────────────────────
 #  Raccourcis
 # ──────────────────────────────────────────────────────────────
 .PHONY: all
-all: clean install check docs build ## Pipeline complet : install → check → docs → build
+all: infra-build infra-up infra-vault ## Déploiement complet: build image, lancement, et init vault
 
 .PHONY: ci
 ci: install check coverage ## Pipeline CI : install → lint → tests → couverture

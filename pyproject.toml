@@ -29,7 +29,22 @@ test = [
   "bump2version",
   "coverage",
   "cryptography",
-  "python-dateutil"
+  "python-dateutil",
+  "httpx",
+  "pytest-asyncio"
+]
+gateway = [
+  "fastapi",
+  "uvicorn",
+  "web3",
+  "pydantic",
+  "sqlalchemy",
+  "asyncpg",
+  "psycopg2-binary",
+  "aiosqlite",
+  "celery",
+  "redis",
+  "hvac"
 ]
 crypto = [
   "cryptography >= 44"

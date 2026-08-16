@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ssl
 from typing import Optional, Callable, Awaitable
 
 from libfin.network.protocol import Iso8583Protocol
@@ -11,10 +12,11 @@ class Iso8583Client:
     """
     Asyncio TCP client for ISO8583 networks with auto-reconnect and async dispatch.
     """
-    def __init__(self, host: str, port: int, length_header_size: int = 2):
+    def __init__(self, host: str, port: int, length_header_size: int = 2, ssl_context: Optional[ssl.SSLContext] = None):
         self.host = host
         self.port = port
         self.protocol = Iso8583Protocol(length_header_size)
+        self.ssl_context = ssl_context
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
@@ -26,9 +28,11 @@ class Iso8583Client:
     async def connect(self):
         while not self._connected:
             try:
-                self.reader, self.writer = await asyncio.open_connection(self.host, self.port)
+                self.reader, self.writer = await asyncio.open_connection(
+                    self.host, self.port, ssl=self.ssl_context
+                )
                 self._connected = True
-                LOGGER.info(f"Connected to {self.host}:{self.port}")
+                LOGGER.info(f"Connected to {self.host}:{self.port}{' with TLS' if self.ssl_context else ''}")
                 self._receive_task = asyncio.create_task(self._receive_loop())
             except Exception as e:
                 LOGGER.error(f"Connection failed to {self.host}:{self.port} - {e}. Retrying in 2s...")
