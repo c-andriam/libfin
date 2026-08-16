@@ -1,36 +1,44 @@
+# ============================================================================
+#  2D Link Fiat-to-Crypto Gateway — production image
+# ============================================================================
+#  Built once and run by four different services (API, worker, beat, one-off
+#  scripts), so the image carries no CMD-specific health check: the API's is
+#  declared in the compose file instead. A HEALTHCHECK baked in here would be
+#  inherited by the worker and the beat container, neither of which serves
+#  HTTP, and both would sit permanently "unhealthy".
+# ============================================================================
+
 FROM python:3.12-slim-bookworm AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libffi-dev \
-    libpq-dev \
+        gcc \
+        libffi-dev \
+        libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-COPY pyproject.toml setup.cfg ./
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir \
-       fastapi uvicorn web3 pydantic \
-       sqlalchemy asyncpg psycopg2-binary aiosqlite alembic \
-       celery redis hvac slowapi \
-       cryptography python-dateutil httpx \
-       gunicorn uvloop httptools
+# Dependencies first: this layer is cached until requirements-prod.txt changes.
+COPY requirements-prod.txt /tmp/requirements-prod.txt
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -r /tmp/requirements-prod.txt
 
-COPY src/ ./src/
-RUN pip install --no-cache-dir .
+COPY pyproject.toml setup.cfg README.rst /build/
+COPY src/ /build/src/
+RUN pip install --no-deps /build
 
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
 
 LABEL maintainer="candriam" \
-      description="2D Link Fiat-to-Crypto Gateway (Enterprise)" \
-      version="1.0.0"
+      description="2D Link Fiat-to-Crypto Gateway" \
+      org.opencontainers.image.source="https://github.com/candriam/libfin"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -39,28 +47,36 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH="/app/src"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
-    libffi8 \
-    curl \
-    tini \
+        libpq5 \
+        libffi8 \
+        curl \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
 COPY pyproject.toml setup.cfg /app/
 
-WORKDIR /app
-
-# Ensure non-root execution
-RUN groupadd -r gateway && useradd -r -g gateway -u 1000 gateway \
+# Unprivileged runtime user. A fixed uid keeps volume ownership predictable
+# across rebuilds; 10001 avoids colliding with the host's first real user.
+RUN groupadd -r -g 10001 gateway \
+    && useradd -r -g gateway -u 10001 -d /app -s /usr/sbin/nologin gateway \
     && chown -R gateway:gateway /app
 USER gateway
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
 EXPOSE 8000
 
+# tini reaps zombies and forwards SIGTERM, so Celery gets a chance to finish
+# the task in flight instead of being killed mid-transfer.
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["gunicorn", "gateway.api:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
+CMD ["gunicorn", "gateway.api:app", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "4", \
+     "--timeout", "60", \
+     "--graceful-timeout", "30", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]

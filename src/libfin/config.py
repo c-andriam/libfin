@@ -305,6 +305,11 @@ config = {
         },
         "72": {"field_name": "Data record", "field_type": "LLLVAR", "field_length": 0},
         "73": {"field_name": "Date, Action", "field_type": "FIXED", "field_length": 6},
+        "90": {
+            "field_name": "Original data elements",
+            "field_type": "FIXED",
+            "field_length": 42,
+        },
         "93": {
             "field_name": "Transaction destination institution ID",
             "field_type": "LLVAR",

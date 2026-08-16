@@ -1,59 +1,144 @@
-version: '3.8'
+# ============================================================================
+#  Production stack.
+# ============================================================================
+#  Topologically identical to podman-compose.sim.yml. The differences are the
+#  three that matter: a real acquirer, a real chain, and a Vault that does not
+#  auto-unseal.
+#
+#  Network segmentation: only Nginx sits on frontend-net. The API port is never
+#  published to the host — the only way in is through TLS on 443.
+#
+#  Usage:
+#      make prod-preflight   # verify everything before anything starts
+#      make prod             # build, migrate, start
+#      make prod-down
+#
+#  Operational note: after any restart of gateway-vault, run
+#  `make prod-vault-unseal`. A sealed Vault means the gateway cannot read the
+#  hot wallet key, and payments will be refused rather than silently mis-served.
+# ============================================================================
+
+networks:
+  frontend-net:
+  backend-net:
+    internal: true          # no route to the internet from the data plane
+
+volumes:
+  pgdata_prod:
+  redisdata_prod:
+  vaultdata_prod:
+  vaultlogs_prod:
 
 services:
+  # ── Data plane ────────────────────────────────────────────────────────────
+
   gateway-postgres:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     container_name: gateway-postgres-prod
     restart: always
     environment:
       POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: gateway_db
+      # scram-sha-256 rather than the md5 default.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    user: root
+    # The certificate has to be owned by postgres and mode 600, which a
+    # read-only bind mount cannot provide. Copy it into place, then hand over
+    # to the image's own entrypoint, which drops privileges as usual.
+    command:
+      - sh
+      - -c
+      - |
+        install -o postgres -g postgres -m 600 /certs/server.key /var/lib/postgresql/server.key
+        install -o postgres -g postgres -m 644 /certs/server.crt /var/lib/postgresql/server.crt
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/server.key
     volumes:
       - pgdata_prod:/var/lib/postgresql/data
+      - ./nginx/ssl:/certs:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U gateway -d gateway_db"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
     networks:
       - backend-net
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
 
   gateway-redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: gateway-redis-prod
     restart: always
-    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 512mb
+      # Never evict. These keys hold nonces, STAN counters and the staged PANs
+      # a reversal depends on; losing one costs a customer their refund.
+      - --maxmemory-policy
+      - noeviction
     volumes:
       - redisdata_prod:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - backend-net
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
 
   gateway-vault:
-    image: hashicorp/vault:1.19
+    image: docker.io/hashicorp/vault:1.19
     container_name: gateway-vault-prod
     restart: always
     cap_add:
       - IPC_LOCK
     environment:
-      VAULT_LOCAL_CONFIG: '{"storage": {"file": {"path": "/vault/file"}}, "listener": [{"tcp": { "address": "0.0.0.0:8200", "tls_disable": 1 }}], "ui": true}'
+      VAULT_ADDR: http://127.0.0.1:8200
+      VAULT_LOCAL_CONFIG: >-
+        {"storage": {"file": {"path": "/vault/file"}},
+         "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": 1}}],
+         "default_lease_ttl": "168h", "max_lease_ttl": "720h",
+         "disable_mlock": false, "ui": false}
+    command: ["server"]
     volumes:
       - vaultdata_prod:/vault/file
-    # Note: Port 8200 is not exposed to host for production, only available on backend-net
+      - vaultlogs_prod:/vault/logs
+    # A sealed Vault answers this endpoint with 501, which is the honest
+    # signal: reachable but not usable until someone unseals it.
     healthcheck:
-      test: ["CMD", "vault", "status"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/v1/sys/health?standbyok=true || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
+      start_period: 10s
     networks:
       - backend-net
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+  # ── Application ───────────────────────────────────────────────────────────
 
   gateway-api:
+    build:
+      context: .
+      containerfile: Containerfile.prod
     image: gateway:prod
     container_name: gateway-api-prod
     restart: always
@@ -65,9 +150,29 @@ services:
       gateway-redis:
         condition: service_healthy
     networks:
-      - backend-net
+      # frontend-net first: with a container on two networks, DNS answers with
+      # the first network's address, and Nginx must get the one it can route to.
       - frontend-net
-    command: gunicorn gateway.api:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+      - backend-net
+    command:
+      - gunicorn
+      - gateway.api:app
+      - --worker-class=uvicorn.workers.UvicornWorker
+      - --bind=0.0.0.0:8000
+      - --workers=${WEB_CONCURRENCY:-4}
+      - --timeout=60
+      - --graceful-timeout=30
+      - --access-logfile=-
+      - --error-logfile=-
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "10"}
 
   gateway-worker:
     image: gateway:prod
@@ -78,9 +183,29 @@ services:
     depends_on:
       gateway-redis:
         condition: service_healthy
+      gateway-postgres:
+        condition: service_healthy
     networks:
       - backend-net
-    command: celery -A gateway.worker.celery_app worker --loglevel=info -Q celery
+    command:
+      - celery
+      - -A
+      - gateway.worker.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=${CELERY_CONCURRENCY:-4}
+    # Long grace period: a SIGKILL during a transfer strands a transaction
+    # between "broadcast" and "recorded". Let the task finish.
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "10"}
 
   gateway-beat:
     image: gateway:prod
@@ -93,28 +218,39 @@ services:
         condition: service_healthy
     networks:
       - backend-net
-    command: celery -A gateway.worker.celery_app beat --loglevel=info
+    command:
+      - celery
+      - -A
+      - gateway.worker.celery_app
+      - beat
+      - --loglevel=info
+      - --schedule=/tmp/celerybeat-schedule
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+  # ── Edge ──────────────────────────────────────────────────────────────────
 
   gateway-nginx:
-    image: nginx:1.25-alpine
+    image: docker.io/library/nginx:1.27-alpine
     container_name: gateway-nginx-prod
     restart: always
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./nginx/ssl:/etc/nginx/ssl:ro,z
     depends_on:
-      - gateway-api
+      gateway-api:
+        condition: service_healthy
     networks:
       - frontend-net
-
-volumes:
-  pgdata_prod:
-  redisdata_prod:
-  vaultdata_prod:
-
-networks:
-  frontend-net:
-  backend-net:
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "10"}

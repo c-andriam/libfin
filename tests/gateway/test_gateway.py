@@ -1,183 +1,254 @@
-import asyncio
+"""
+Gateway behaviour tests.
+
+The emphasis is on the paths where money can go missing: a declined card, an
+acquirer that never answers, a crypto transfer that fails after the fiat was
+captured. The happy path is the easy one.
+"""
+
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
 import pytest
-import pytest_asyncio
-import httpx
-from unittest.mock import patch, MagicMock
-from gateway.api import app
-from gateway.database import init_db
 
-pytestmark = pytest.mark.asyncio(loop_scope="session")
+from gateway.models import TransactionStatus
 
-@pytest_asyncio.fixture
-async def mock_bank_server():
-    process = await asyncio.create_subprocess_exec(
-        "python", "tests/simulator/bank_server.py",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+pytestmark = pytest.mark.asyncio(loop_scope="function")
+
+APPROVED_PAN = "4111111111111111"
+DECLINED_PAN = "4000000000000002"
+SILENT_PAN = "4000000000000028"
+WALLET = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
+
+
+def payload(expiry: str, pan: str = APPROVED_PAN, amount: str = "50.00") -> dict:
+    return {
+        "pan": pan,
+        "expiry": expiry,
+        "cvv": "123",
+        "amount": amount,
+        "target_wallet": WALLET,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Happy path
+# ---------------------------------------------------------------------------
+
+
+async def test_successful_payment_returns_202(gateway_client, expiry):
+    """Fiat is approved and the crypto leg is handed to a worker."""
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
+
+        response = await gateway_client.post(
+            "/pay", json=payload(expiry), headers={"Idempotency-Key": "happy-001"}
+        )
+
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["status"] == "FIAT_APPROVED"
+        assert body["stan"]
+        task.apply_async.assert_called_once()
+
+
+async def test_payment_does_not_send_the_pan_to_the_worker(gateway_client, expiry):
+    """Card data must never enter a broker payload (PCI-DSS)."""
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
+
+        await gateway_client.post(
+            "/pay", json=payload(expiry), headers={"Idempotency-Key": "no-pan-001"}
+        )
+
+        _, kwargs = task.apply_async.call_args
+        queued = str(kwargs)
+        assert APPROVED_PAN not in queued
+        assert set(kwargs["kwargs"]) == {"tx_id"}
+
+
+async def test_masked_pan_only_is_persisted(gateway_client, expiry):
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
+        response = await gateway_client.post(
+            "/pay", json=payload(expiry), headers={"Idempotency-Key": "mask-001"}
+        )
+        tx_id = response.json()["transaction_id"]
+
+    status = (await gateway_client.get(f"/transaction/{tx_id}")).json()
+    assert status["masked_pan"] == "411111******1111"
+    assert APPROVED_PAN not in str(status)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
+
+
+async def test_idempotency_prevents_double_charge(gateway_client, expiry):
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
+        headers = {"Idempotency-Key": "idem-002"}
+
+        first = await gateway_client.post("/pay", json=payload(expiry), headers=headers)
+        second = await gateway_client.post("/pay", json=payload(expiry), headers=headers)
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json()["transaction_id"] == first.json()["transaction_id"]
+        # The bank must have been asked exactly once.
+        assert task.apply_async.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+async def test_luhn_rejects_invalid_pan(gateway_client, expiry):
+    response = await gateway_client.post(
+        "/pay", json=payload(expiry, pan="4111111111111112")
     )
-    await asyncio.sleep(1)
-    yield process
-    process.terminate()
-    await process.wait()
+    assert response.status_code == 400
+    assert "Invalid card number" in response.json()["detail"]
+
+
+async def test_expired_card_is_rejected(gateway_client):
+    response = await gateway_client.post("/pay", json=payload("2001"))
+    assert response.status_code == 422
+
+
+async def test_amount_above_the_ceiling_is_rejected(gateway_client, expiry):
+    response = await gateway_client.post(
+        "/pay", json=payload(expiry, amount="999999.00")
+    )
+    assert response.status_code == 422
+
+
+async def test_malformed_wallet_is_rejected(gateway_client, expiry):
+    body = payload(expiry)
+    body["target_wallet"] = "not-an-address"
+    assert (await gateway_client.post("/pay", json=body)).status_code == 422
+
 
 # ---------------------------------------------------------------------------
-# Test 1: Successful Payment (202 Accepted + Celery dispatch)
+# Bank refusals and silence
 # ---------------------------------------------------------------------------
 
-async def test_successful_payment_returns_202(mock_bank_server):
-    """API must approve fiat and return 202 immediately (crypto is async)."""
-    with patch("gateway.worker.process_crypto_transfer") as mock_celery_task:
-        mock_celery_task.delay = MagicMock()
 
-        from gateway.api import acquirer_service
-        await init_db()
-        await acquirer_service.start()
+async def test_declined_card_returns_400_and_does_not_queue_crypto(gateway_client, expiry):
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
 
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            payload = {
-                "pan": "4111111111111111",
-                "expiry": "2512",
-                "cvv": "123",
-                "amount": 50.0,
-                "target_wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-            }
+        response = await gateway_client.post(
+            "/pay", json=payload(expiry, pan=DECLINED_PAN), headers={"Idempotency-Key": "dec-1"}
+        )
 
-            response = await client.post("/pay", json=payload, headers={"Idempotency-Key": "unique-key-001"})
-
-            assert response.status_code == 202
-            data = response.json()
-            assert data["status"] == "FIAT_APPROVED"
-            assert "transaction_id" in data
-            assert "stan" in data
-
-            # Celery task must have been dispatched
-            mock_celery_task.delay.assert_called_once()
-
-        await acquirer_service.stop()
-
-# ---------------------------------------------------------------------------
-# Test 2: Idempotency - Duplicate request returns existing transaction
-# ---------------------------------------------------------------------------
-
-async def test_idempotency_prevents_double_charge(mock_bank_server):
-    """The same Idempotency-Key must NOT trigger a second bank authorization."""
-    with patch("gateway.worker.process_crypto_transfer") as mock_celery_task:
-        mock_celery_task.delay = MagicMock()
-
-        from gateway.api import acquirer_service
-        await init_db()
-        await acquirer_service.start()
-
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            payload = {
-                "pan": "4111111111111111",
-                "expiry": "2512",
-                "cvv": "123",
-                "amount": 100.0,
-                "target_wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-            }
-            headers = {"Idempotency-Key": "idempotent-test-002"}
-
-            # First request
-            response1 = await client.post("/pay", json=payload, headers=headers)
-            assert response1.status_code == 202
-            tx_id_1 = response1.json()["transaction_id"]
-
-            # Second request (same key) - should NOT call bank again
-            response2 = await client.post("/pay", json=payload, headers=headers)
-            assert response2.status_code == 202
-            data2 = response2.json()
-            assert data2["transaction_id"] == tx_id_1
-            assert data2["message"] == "Duplicate request. Returning existing transaction."
-
-            # Celery must have been called only ONCE
-            assert mock_celery_task.delay.call_count == 1
-
-        await acquirer_service.stop()
-
-# ---------------------------------------------------------------------------
-# Test 3: Circuit Breaker blocks requests when Web3 is down
-# ---------------------------------------------------------------------------
-
-async def test_circuit_breaker_rejects_when_open():
-    """When the circuit breaker is OPEN, requests must be rejected with 503."""
-    from gateway.circuit_breaker import web3_circuit_breaker, CircuitState
-
-    # Manually open the circuit breaker
-    original_state = web3_circuit_breaker.state
-    web3_circuit_breaker.state = CircuitState.OPEN
-    web3_circuit_breaker.last_failure_time = __import__("time").time()
-
-    try:
-        await init_db()
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            payload = {
-                "pan": "4111111111111111",
-                "expiry": "2512",
-                "cvv": "123",
-                "amount": 25.0,
-                "target_wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-            }
-
-            response = await client.post("/pay", json=payload)
-            assert response.status_code == 503
-            assert "blockchain network unreachable" in response.json()["detail"]
-    finally:
-        # Restore
-        web3_circuit_breaker.state = original_state
-        web3_circuit_breaker.failure_count = 0
-
-# ---------------------------------------------------------------------------
-# Test 4: Luhn validation rejects invalid card numbers
-# ---------------------------------------------------------------------------
-
-async def test_luhn_rejects_invalid_pan(mock_bank_server):
-    """An invalid card number must be rejected immediately without calling the bank."""
-    await init_db()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        payload = {
-            "pan": "1234567890123456",  # Invalid Luhn
-            "expiry": "2512",
-            "cvv": "123",
-            "amount": 10.0,
-            "target_wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-        }
-
-        response = await client.post("/pay", json=payload)
         assert response.status_code == 400
-        assert "Invalid card number" in response.json()["detail"]
+        task.apply_async.assert_not_called()
+
+
+async def test_acquirer_silence_is_treated_as_unknown_not_declined(gateway_client, expiry):
+    """A missing 0210 means we may have debited the cardholder: reverse, don't shrug."""
+    with patch("gateway.worker.retry_reversal") as reversal:
+        reversal.apply_async = MagicMock()
+
+        response = await gateway_client.post(
+            "/pay", json=payload(expiry, pan=SILENT_PAN), headers={"Idempotency-Key": "silent-1"}
+        )
+
+        assert response.status_code == 504
+        reversal.apply_async.assert_called_once()
+
+    from sqlalchemy import select
+
+    from gateway.database import async_session
+    from gateway.models import Transaction
+
+    async with async_session() as session:
+        tx = (
+            await session.execute(
+                select(Transaction).where(Transaction.idempotency_key == "silent-1")
+            )
+        ).scalar_one()
+        assert tx.status is TransactionStatus.FIAT_UNKNOWN
+
 
 # ---------------------------------------------------------------------------
-# Test 5: Transaction status endpoint
+# Circuit breaker
 # ---------------------------------------------------------------------------
 
-async def test_get_transaction_status(mock_bank_server):
-    """GET /transaction/{id} must return the current status of a transaction."""
-    with patch("gateway.worker.process_crypto_transfer") as mock_celery_task:
-        mock_celery_task.delay = MagicMock()
 
-        from gateway.api import acquirer_service
-        await init_db()
-        await acquirer_service.start()
+async def test_circuit_breaker_rejects_when_open(gateway_client, expiry):
+    from gateway.circuit_breaker import CircuitState, web3_circuit_breaker
 
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            payload = {
-                "pan": "4111111111111111",
-                "expiry": "2512",
-                "cvv": "123",
-                "amount": 200.0,
-                "target_wallet": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-            }
+    for _ in range(web3_circuit_breaker.failure_threshold):
+        web3_circuit_breaker.record_failure()
+    assert web3_circuit_breaker.state is CircuitState.OPEN
 
-            # Create transaction
-            resp = await client.post("/pay", json=payload, headers={"Idempotency-Key": "status-test-003"})
-            tx_id = resp.json()["transaction_id"]
+    response = await gateway_client.post("/pay", json=payload(expiry))
 
-            # Poll status
-            status_resp = await client.get(f"/transaction/{tx_id}")
-            assert status_resp.status_code == 200
-            data = status_resp.json()
-            assert data["id"] == tx_id
-            assert data["status"] == "FIAT_APPROVED"
+    assert response.status_code == 503
+    # The customer must be told nothing was taken.
+    assert "No funds were debited" in response.json()["detail"]
 
-        await acquirer_service.stop()
+
+async def test_circuit_breaker_fails_closed_when_redis_is_unreachable():
+    """During an infrastructure incident the breaker must refuse, not wave through."""
+    from gateway.circuit_breaker import Web3CircuitBreaker
+
+    breaker = Web3CircuitBreaker(fail_closed=True)
+    with patch.object(breaker.redis, "get", side_effect=ConnectionError("redis is down")):
+        assert breaker.can_execute() is False
+
+    lenient = Web3CircuitBreaker(fail_closed=False)
+    with patch.object(lenient.redis, "get", side_effect=ConnectionError("redis is down")):
+        assert lenient.can_execute() is True
+
+
+async def test_only_one_probe_passes_in_half_open_state():
+    from gateway.circuit_breaker import Web3CircuitBreaker
+
+    breaker = Web3CircuitBreaker(failure_threshold=1, recovery_timeout_sec=0)
+    breaker.reset()
+    breaker.record_failure()
+
+    assert breaker.can_execute() is True   # the probe
+    assert breaker.can_execute() is False  # everyone else waits
+
+
+# ---------------------------------------------------------------------------
+# Status endpoint
+# ---------------------------------------------------------------------------
+
+
+async def test_get_transaction_status(gateway_client, expiry):
+    with patch("gateway.worker.process_crypto_transfer") as task:
+        task.apply_async = MagicMock()
+        created = await gateway_client.post(
+            "/pay", json=payload(expiry), headers={"Idempotency-Key": "status-003"}
+        )
+        tx_id = created.json()["transaction_id"]
+
+    response = await gateway_client.get(f"/transaction/{tx_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == tx_id
+    assert body["status"] == "FIAT_APPROVED"
+    assert Decimal(body["amount"]) == Decimal("50.00")
+
+
+async def test_unknown_transaction_returns_404(gateway_client):
+    assert (await gateway_client.get("/transaction/999999")).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
+async def test_health_is_public_and_shallow(gateway_client):
+    response = await gateway_client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"

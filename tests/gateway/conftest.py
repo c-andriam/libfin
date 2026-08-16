@@ -1,0 +1,120 @@
+"""
+Test rig for the gateway.
+
+Redis is patched out before any gateway module is imported, because several of
+them build a client at import time (the circuit breaker, the PAN vault, the STAN
+allocator). Patching afterwards would leave those holding real sockets.
+"""
+
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
+# ── Environment ─────────────────────────────────────────────────────────────
+# Set before importing gateway.config, which snapshots the environment once.
+os.environ.setdefault("GATEWAY_MODE", "simulation")
+os.environ.setdefault("ENVIRONMENT", "development")
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("AUTO_CREATE_SCHEMA", "true")
+os.environ.setdefault("BANK_HOST", "127.0.0.1")
+os.environ.setdefault("BANK_PORT", "9000")
+os.environ.setdefault("BANK_ECHO_INTERVAL_SEC", "0")  # no heartbeat noise in tests
+os.environ.setdefault("ACQUIRER_TERMINAL_ID", "TERM0001")
+os.environ.setdefault("ACQUIRER_MERCHANT_ID", "SIMULATOR000001")
+os.environ.setdefault("PAN_ENCRYPTION_KEY", "test-only-pan-encryption-key")
+os.environ.setdefault("AMOUNT_MIN", "0.01")
+# The rate limiter keys on the client address, which is the same for every test
+# in this file. Raise the ceiling so it does not leak between them.
+os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "1000")
+
+# ── Redis ───────────────────────────────────────────────────────────────────
+import fakeredis  # noqa: E402
+import redis  # noqa: E402
+import redis.asyncio  # noqa: E402
+
+_fake_server = fakeredis.FakeServer()
+
+redis.from_url = lambda *a, **kw: fakeredis.FakeRedis(server=_fake_server)
+redis.Redis.from_url = classmethod(lambda cls, *a, **kw: fakeredis.FakeRedis(server=_fake_server))
+redis.asyncio.from_url = lambda *a, **kw: fakeredis.aioredis.FakeRedis(server=_fake_server)
+
+import pytest_asyncio  # noqa: E402
+
+from gateway.circuit_breaker import web3_circuit_breaker  # noqa: E402
+
+
+# ── Fixtures ────────────────────────────────────────────────────────────────
+
+
+def future_expiry(years: int = 3) -> str:
+    """A YYMM expiry that stays valid however long this suite lives."""
+    target = datetime.now(timezone.utc) + timedelta(days=365 * years)
+    return f"{target.year % 100:02d}{target.month:02d}"
+
+
+@pytest.fixture
+def expiry() -> str:
+    return future_expiry()
+
+
+@pytest.fixture(autouse=True)
+def clean_redis():
+    """Every test starts with a closed circuit and empty counters."""
+    fakeredis.FakeRedis(server=_fake_server).flushall()
+    web3_circuit_breaker.reset()
+    yield
+    fakeredis.FakeRedis(server=_fake_server).flushall()
+
+
+@pytest_asyncio.fixture
+async def bank_server():
+    """Run the mock acquirer for the duration of a test."""
+    import asyncio
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        os.path.join(os.path.dirname(__file__), "..", "simulator", "bank_server.py"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "SIM_SLOW_DELAY": "2"},
+    )
+    # Give the listener a moment to bind.
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        try:
+            _, writer = await asyncio.open_connection("127.0.0.1", 9000)
+            writer.close()
+            break
+        except OSError:
+            continue
+
+    yield process
+
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        process.kill()
+
+
+@pytest_asyncio.fixture
+async def gateway_client(bank_server):
+    """An HTTP client wired to a live gateway app and the mock acquirer."""
+    import httpx
+
+    from gateway.api import acquirer_service, app
+    from gateway.database import init_db
+
+    await init_db()
+    await acquirer_service.start()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+    await acquirer_service.stop()

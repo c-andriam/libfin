@@ -127,12 +127,12 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.env
+#.env
 .venv
-env/
+#env/
 venv*/
-ENV/
-env.bak/
+#ENV/
+#env.bak/
 venv.bak/
 
 # Spyder project settings
@@ -200,3 +200,40 @@ out/
 
 # JIRA plugin
 atlassian-ide-plugin.xml
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Gateway — secrets and generated material
+# ─────────────────────────────────────────────────────────────────────────────
+# Real environment files. .env.prod holds acquirer credentials, the API key and
+# the PAN encryption key: it must never reach a remote.
+.env.prod
+.env.staging
+.env.local
+# .env.sim is deliberately NOT ignored: every value in it is fake and it is what
+# makes `make sim` work without setup.
+!.env.sim
+!.env.prod.example
+
+# TLS material. Certificates are generated per environment by `make certs`.
+#nginx/ssl/
+#*.pem
+#*.key
+#*.crt
+#*.p12
+#*.pfx
+
+# Vault unseal keys and root tokens, if an operator ever writes them down here.
+#vault-keys*.txt
+#vault-init*.json
+
+# Database dumps: these contain masked PANs, amounts and wallet addresses.
+backups/
+*.dump
+*.sql.gz
+
+# Foundry artefacts from the simulation token deployment.
+sim/out/
+sim/cache/
+sim/lib/
+sim/src/
+sim/foundry.toml

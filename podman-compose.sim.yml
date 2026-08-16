@@ -1,0 +1,262 @@
+# ============================================================================
+#  Simulation stack — the production topology, with simulated externals.
+# ============================================================================
+#  Same image, same Gunicorn, same Nginx and TLS, same Celery worker and beat,
+#  same authenticated Redis and same reverse proxy as production. Only the two
+#  things that cost real money are swapped:
+#
+#      real acquirer  ->  bank-simulator  (ISO 8583, can decline and time out)
+#      Ethereum       ->  anvil           (local chain, real signing/receipts)
+#
+#  That is the point: the code path under test is the production one. Nothing
+#  in src/ knows which stack it is running in — the difference is entirely in
+#  BANK_HOST and WEB3_RPC_URL.
+#
+#  Two deliberate divergences from production, both to keep the stack
+#  zero-setup, both blocked in production by scripts/preflight_check.sh:
+#      * Vault runs in dev mode, so it auto-unseals on restart.
+#      * The acquirer link is plaintext, because the simulator has no TLS.
+#
+#  Usage:
+#      make sim          # build, start, deploy the token, wait until healthy
+#      make sim-logs
+#      make sim-down
+# ============================================================================
+
+networks:
+  frontend-net:
+  backend-net:
+
+volumes:
+  pgdata_sim:
+  redisdata_sim:
+  anvildata_sim:
+
+services:
+  # ── Simulated externals ───────────────────────────────────────────────────
+
+  gateway-anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: gateway-anvil-sim
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--chain-id=31337"
+      - "--block-time=1"          # mined blocks, so confirmations are real
+      # Persist chain state. Without this, any restart wipes the deployed token
+      # and every subsequent payment reverses — which looks exactly like a
+      # gateway bug and wastes an afternoon.
+      - "--state=/state/anvil.json"
+      - "--state-interval=5"
+      - "--silent"
+    user: root
+    volumes:
+      - anvildata_sim:/state
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  gateway-token-deployer:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: gateway-token-deployer-sim
+    entrypoint: ["/bin/sh", "/sim/deploy_token.sh"]
+    environment:
+      RPC_URL: http://gateway-anvil:8545
+      # Anvil account #1 — the gateway's simulated hot wallet.
+      GATEWAY_WALLET: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+    volumes:
+      - ./sim:/sim:ro,z
+    depends_on:
+      gateway-anvil:
+        condition: service_healthy
+    networks:
+      - backend-net
+    restart: "no"
+
+  bank-simulator:
+    image: gateway:sim
+    container_name: gateway-bank-sim
+    restart: unless-stopped
+    command: ["python", "/app/tests/simulator/bank_server.py"]
+    environment:
+      SIM_LOG_LEVEL: INFO
+      SIM_SLOW_DELAY: "15"
+    volumes:
+      - ./tests/simulator:/app/tests/simulator:ro,z
+    networks:
+      - backend-net
+
+  # ── Infrastructure (mirrors production) ───────────────────────────────────
+
+  gateway-postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: gateway-postgres-sim
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-simulation_pg_password}
+      POSTGRES_DB: gateway_db
+    volumes:
+      - pgdata_sim:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend-net
+
+  gateway-redis:
+    image: docker.io/library/redis:7-alpine
+    container_name: gateway-redis-sim
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:-simulation_redis_password}
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      # Never evict: these keys hold nonces, STANs and staged PANs.
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redisdata_sim:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-simulation_redis_password}
+    networks:
+      - backend-net
+
+  gateway-vault:
+    image: docker.io/hashicorp/vault:1.19
+    container_name: gateway-vault-sim
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      # Dev mode: auto-unsealed, in-memory. Production uses file storage and a
+      # real unseal ceremony — see podman-compose.prod.yml.
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:-simulation-root-token}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8200/v1/sys/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - backend-net
+
+  # ── Gateway (identical to production) ─────────────────────────────────────
+
+  gateway-api:
+    build:
+      context: .
+      containerfile: Containerfile.prod
+    image: gateway:sim
+    container_name: gateway-api-sim
+    restart: unless-stopped
+    env_file:
+      - .env.sim
+    depends_on:
+      gateway-postgres:
+        condition: service_healthy
+      gateway-redis:
+        condition: service_healthy
+      gateway-vault:
+        condition: service_healthy
+      gateway-anvil:
+        condition: service_healthy
+    networks:
+      # frontend-net first: with a container on two networks, DNS answers with
+      # the first network's address, and Nginx must get the one it can route to.
+      - frontend-net
+      - backend-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  gateway-worker:
+    image: gateway:sim
+    container_name: gateway-worker-sim
+    restart: unless-stopped
+    env_file:
+      - .env.sim
+    depends_on:
+      gateway-redis:
+        condition: service_healthy
+      gateway-postgres:
+        condition: service_healthy
+      # The worker is the component that actually signs transfers; starting it
+      # before the chain answers means the first payment fails and reverses.
+      gateway-anvil:
+        condition: service_healthy
+    networks:
+      - backend-net
+    command:
+      - celery
+      - -A
+      - gateway.worker.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=4
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  gateway-beat:
+    image: gateway:sim
+    container_name: gateway-beat-sim
+    restart: unless-stopped
+    env_file:
+      - .env.sim
+    depends_on:
+      gateway-redis:
+        condition: service_healthy
+    networks:
+      - backend-net
+    command:
+      - celery
+      - -A
+      - gateway.worker.celery_app
+      - beat
+      - --loglevel=info
+      # Beat state in /tmp: the container filesystem is read-mostly and the
+      # schedule is rebuilt from config on every start anyway.
+      - --schedule=/tmp/celerybeat-schedule
+
+  gateway-nginx:
+    image: docker.io/library/nginx:1.27-alpine
+    container_name: gateway-nginx-sim
+    restart: unless-stopped
+    ports:
+      - "8443:443"
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - ./nginx/ssl:/etc/nginx/ssl:ro,z
+    depends_on:
+      - gateway-api
+    networks:
+      - frontend-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

@@ -31,20 +31,29 @@ test = [
   "cryptography",
   "python-dateutil",
   "httpx",
-  "pytest-asyncio"
+  "pytest-asyncio",
+  # The gateway tests run against an in-process Redis; lupa gives fakeredis the
+  # Lua support the circuit breaker's atomic transitions need.
+  "fakeredis",
+  "lupa"
 ]
 gateway = [
   "fastapi",
   "uvicorn",
-  "web3",
-  "pydantic",
-  "sqlalchemy",
+  "gunicorn",
+  "web3 >= 7",
+  "pydantic >= 2",
+  "sqlalchemy >= 2",
   "asyncpg",
   "psycopg2-binary",
   "aiosqlite",
+  "alembic",
   "celery",
   "redis",
-  "hvac"
+  "hvac",
+  "slowapi",
+  # Encrypts the card number staged for a possible reversal.
+  "cryptography >= 44"
 ]
 crypto = [
   "cryptography >= 44"

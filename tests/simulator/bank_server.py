@@ -1,39 +1,185 @@
+#!/usr/bin/env python3
+"""
+Mock acquirer for simulation runs.
+
+A simulator that approves everything only ever exercises the happy path, which
+is the one least likely to lose money. This one can decline, stay silent, refuse
+a reversal and answer echoes, so the failure branches of the gateway — the ones
+that decide whether a cardholder gets refunded — are actually reachable.
+
+Behaviour is selected by the card number, so a test or a manual curl picks a
+scenario just by choosing a PAN:
+
+    4111111111111111  approve
+    4000000000000002  decline (51, insufficient funds)
+    4000000000000010  decline (05, do not honour)
+    4000000000000028  no response at all (authorisation timeout)
+    4000000000000036  approve, then refuse the reversal
+    4000000000000044  approve, but answer slowly (SIM_SLOW_DELAY seconds)
+
+Every scenario is also reachable through ISO 8583 as usual; nothing here is
+special-cased inside the gateway.
+"""
+
 import asyncio
 import logging
-from libfin.network.server import Iso8583Server
-from libfin import iso8583
+import os
+import sys
+from datetime import datetime, timezone
 
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger(__name__)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+
+from libfin import iso8583  # noqa: E402
+from libfin.network.server import Iso8583Server  # noqa: E402
+
+logging.basicConfig(
+    level=os.environ.get("SIM_LOG_LEVEL", "INFO"),
+    format="%(asctime)s [bank-sim] %(levelname)s %(message)s",
+)
+LOGGER = logging.getLogger("bank-simulator")
+
+APPROVED = "00"
+
+# PAN -> (action code, behaviour)
+SCENARIOS = {
+    "4000000000000002": ("51", "decline"),
+    "4000000000000010": ("05", "decline"),
+    "4000000000000028": (None, "silent"),
+    "4000000000000036": (APPROVED, "reject_reversal"),
+    "4000000000000044": (APPROVED, "slow"),
+}
+
+SLOW_DELAY = float(os.environ.get("SIM_SLOW_DELAY", "15"))
+
+#: STANs whose reversal must be refused, populated when a 0200 is approved.
+_reject_reversal_stans: set = set()
+_auth_count = 0
+
+
+def _auth_code(stan: str) -> str:
+    return f"{(int(stan) * 7919) % 1000000:06d}"
+
+
+async def _handle_authorization(msg: dict) -> bytes:
+    global _auth_count
+    _auth_count += 1
+
+    pan = str(msg.get("DE2", ""))
+    stan = str(msg.get("DE11", "")).zfill(6)
+    amount = msg.get("DE4", 0)
+    action_code, behaviour = SCENARIOS.get(pan, (APPROVED, "approve"))
+
+    if behaviour == "silent":
+        LOGGER.warning(f"STAN={stan}: staying silent on purpose (timeout scenario).")
+        return b""
+
+    if behaviour == "slow":
+        LOGGER.info(f"STAN={stan}: delaying the response by {SLOW_DELAY}s.")
+        await asyncio.sleep(SLOW_DELAY)
+
+    if behaviour == "reject_reversal":
+        _reject_reversal_stans.add(stan)
+
+    response = dict(msg)
+    response["MTI"] = "0210"
+    response["DE39"] = action_code
+    if action_code == APPROVED:
+        response["DE38"] = _auth_code(stan)
+        LOGGER.info(f"STAN={stan}: approved {amount} minor units.")
+    else:
+        LOGGER.info(f"STAN={stan}: declined with {action_code}.")
+
+    # An acquirer echoes the retrieval reference number back untouched.
+    return iso8583.dumps(response)
+
+
+async def _handle_reversal(msg: dict) -> bytes:
+    stan = str(msg.get("DE11", "")).zfill(6)
+    original = str(msg.get("DE90", ""))
+    original_stan = original[4:10] if len(original) >= 10 else ""
+    pan = str(msg.get("DE2", ""))
+
+    response = dict(msg)
+    response["MTI"] = "0410"
+
+    if "*" in pan or not pan.isdigit():
+        # Exactly what a real acquirer does with a masked PAN, and the reason
+        # the gateway must keep the real one available for reversals.
+        LOGGER.error(f"STAN={stan}: reversal carries an unusable PAN {pan!r}; rejecting.")
+        response["DE39"] = "30"  # format error
+    elif original_stan in _reject_reversal_stans:
+        LOGGER.warning(f"STAN={stan}: refusing the reversal of {original_stan} (scenario).")
+        response["DE39"] = "96"  # system malfunction
+    elif not original_stan:
+        LOGGER.error(f"STAN={stan}: reversal without usable original data elements.")
+        response["DE39"] = "30"
+    else:
+        LOGGER.info(f"STAN={stan}: reversal of {original_stan} accepted.")
+        response["DE39"] = APPROVED
+
+    return iso8583.dumps(response)
+
+
+async def _handle_echo(msg: dict) -> bytes:
+    response = dict(msg)
+    response["MTI"] = "0810"
+    response["DE39"] = APPROVED
+    LOGGER.debug(f"Echo answered (STAN={msg.get('DE11')}).")
+    return iso8583.dumps(response)
+
 
 async def handle_message(msg_bytes: bytes) -> bytes:
     try:
-        msg_dict = iso8583.loads(msg_bytes)
-        LOGGER.info(f"Bank Server received: MTI={msg_dict.get('MTI')}, STAN={msg_dict.get('DE11')}, Amount={msg_dict.get('DE4')}")
-        
-        # Approve all 0200 requests
-        if msg_dict.get("MTI") == "0200":
-            # Response MTI
-            msg_dict["MTI"] = "0210"
-            # Set Action Code to "00" (Approved)
-            msg_dict["DE39"] = "00"
-            
-            LOGGER.info(f"Bank Server approving request. STAN={msg_dict.get('DE11')}")
-            return iso8583.dumps(msg_dict)
-            
-    except Exception as e:
-        LOGGER.error(f"Error handling message: {e}")
-        
+        msg = iso8583.loads(msg_bytes)
+    except Exception as exc:
+        LOGGER.error(f"Undecodable message: {exc}")
+        return b""
+
+    mti = str(msg.get("MTI", ""))
+    LOGGER.debug(f"Received MTI={mti} STAN={msg.get('DE11')}")
+
+    try:
+        if mti == "0200":
+            return await _handle_authorization(msg)
+        if mti == "0400":
+            return await _handle_reversal(msg)
+        if mti == "0800":
+            return await _handle_echo(msg)
+    except Exception as exc:
+        LOGGER.exception(f"Failed to build a response for MTI={mti}: {exc}")
+        return b""
+
+    LOGGER.warning(f"Unsupported MTI={mti}; ignoring.")
     return b""
 
-async def main():
-    server = Iso8583Server("0.0.0.0", 9000, handle_message, length_header_size=2)
-    LOGGER.info("Starting Mock Bank Server on 0.0.0.0:9000")
-    await server.start()
-    
-    # Keep server running
+
+async def _echo_probe(server_ready: asyncio.Event) -> None:
+    """Log a heartbeat so operators can see the simulator is alive."""
+    await server_ready.wait()
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(300)
+        LOGGER.info(
+            f"Simulator alive since start; {_auth_count} authorisation(s) handled "
+            f"as of {datetime.now(timezone.utc).isoformat(timespec='seconds')}."
+        )
+
+
+async def main() -> None:
+    host = os.environ.get("SIM_HOST", "0.0.0.0")
+    port = int(os.environ.get("SIM_PORT", "9000"))
+
+    server = Iso8583Server(host, port, handle_message, length_header_size=2)
+    LOGGER.info(f"Mock acquirer listening on {host}:{port}")
+    LOGGER.info("Scenario cards: " + ", ".join(f"{p}={b[1]}" for p, b in SCENARIOS.items()))
+    await server.start()
+
+    ready = asyncio.Event()
+    ready.set()
+    await _echo_probe(ready)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        LOGGER.info("Simulator stopped.")

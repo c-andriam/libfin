@@ -32,6 +32,17 @@ docs/
 *.md
 *.rst
 LICENSE
+# ...except the readme, which pyproject.toml declares and setuptools reads at
+# build time. Excluding it breaks `pip install .` inside the image.
+!README.rst
+
+# Secrets. Nothing in the Containerfile copies these, but a stray COPY should
+# not be able to bake credentials into a layer.
+.env
+.env.*
+!.env.prod.example
+nginx/ssl/
+backups/
 
 # Build artifacts
 dist/

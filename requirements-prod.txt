@@ -1,0 +1,35 @@
+# Production dependency set for the gateway image.
+#
+# Pinned on purpose. An unpinned `pip install web3` is what silently upgraded
+# the image from web3 6 to web3 7, where `SignedTransaction.rawTransaction` was
+# renamed — every transfer would have failed at broadcast time, after the card
+# had already been charged. Bump these deliberately and re-run the simulation
+# stack before promoting a change.
+
+# ── Web layer ───────────────────────────────────────────────────────────────
+fastapi==0.141.1
+uvicorn==0.52.3
+gunicorn==26.0.0
+uvloop==0.22.1
+httptools==0.8.0
+pydantic==2.13.4
+slowapi==0.1.10
+httpx==0.28.1
+
+# ── Persistence ─────────────────────────────────────────────────────────────
+SQLAlchemy==2.0.52
+asyncpg==0.31.0
+aiosqlite==0.22.1
+alembic==1.19.1
+
+# ── Queue and cache ─────────────────────────────────────────────────────────
+celery==5.6.3
+redis==8.1.0
+
+# ── Secrets and crypto ──────────────────────────────────────────────────────
+hvac==2.4.0
+web3==7.16.0
+cryptography==46.0.4
+
+# ── Misc ────────────────────────────────────────────────────────────────────
+python-dateutil==2.9.0.post0

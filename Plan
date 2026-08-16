@@ -1,0 +1,160 @@
+Production Readiness — Plan d'Implémentation
+============================================================================
+Objectif : le système est prêt à tourner en production avec `make prod`, une
+fois les dépendances externes en place (acquéreur bancaire, clés RPC,
+certificats TLS).
+
+Ajout du 16/08/2026 : la simulation vit désormais À CÔTÉ de la production, avec
+la même topologie. On répète la prod sans risquer d'argent, puis on remplit les
+champs et on lance.
+
+    make sim    →  topologie de prod, acquéreur + blockchain simulés
+    make prod   →  même code, mêmes conteneurs, dépendances réelles
+
+Le code ne sait pas dans quel stack il tourne : la différence tient entièrement
+à BANK_HOST et WEB3_RPC_URL. C'est ce qui rend la simulation probante.
+
+============================================================================
+Phase 1 : Sécurité & Infrastructure
+============================================================================
+[x] nginx/nginx.conf — TLS, reverse proxy, rate limit
+    [x] Corrigé : `listen 443 ssl http2` déprécié → `http2 on`
+    [x] Corrigé : rate limit renvoyait 503, indistinguable du circuit breaker → 429
+    [x] Ajouté : timeouts proxy, client_max_body_size, no-store, proxy_next_upstream off
+    [x] Ajouté : chemin ACME préservé pour le renouvellement des certificats
+[x] podman-compose.prod.yml
+    [x] Corrigé : mots de passe Postgres/Redis lus depuis .env.prod (--env-file)
+    [x] Corrigé : healthchecks par service (worker/beat n'exposent pas HTTP)
+    [x] Ajouté : Postgres SSL réel, backend-net `internal`, rotation des logs
+    [x] Ajouté : stop_grace_period 120s sur le worker (ne pas tuer un transfert)
+[x] Containerfile.prod
+    [x] Corrigé : dépendances figées (requirements-prod.txt) — c'est web3 v7 non
+        figé qui aurait fait échouer chaque transfert après débit de la carte
+    [x] Corrigé : HEALTHCHECK retiré de l'image (héritée par worker/beat)
+[x] scripts/gen_certs.sh — génération de certificats auto-signés
+
+============================================================================
+Phase 2 : Durcissement du Code
+============================================================================
+[x] src/gateway/config.py [NOUVEAU]
+    Configuration centralisée + bascule simulation/production + validation.
+    C'est le point unique qui liste tout ce qu'il faut remplir avant la prod.
+
+[x] api.py
+    [x] Auth compare_digest, slowapi, CORS, Swagger désactivé en prod
+    [x] Corrigé : montants en Decimal (int(1.15*100) == 114 — perte réelle)
+    [x] Corrigé : expiration de carte réellement vérifiée
+    [x] Corrigé : idempotence atomique (IntegrityError sur la course)
+    [x] Corrigé : le PAN n'est plus passé à Celery (violation PCI-DSS)
+    [x] Corrigé : rate limit derrière Nginx (X-Forwarded-For, sinon 1 seul seau)
+    [x] Corrigé : /health/ready n'expose plus les erreurs internes
+    [x] AJOUT : timeout acquéreur → FIAT_UNKNOWN + reversal, plus « refusé »
+    [x] AJOUT : échec de mise en file Celery → reversal immédiat
+
+[x] worker.py
+    [x] Bank env vars, retries Celery, circuit breaker
+    [x] CRITIQUE corrigé : le reversal utilisait le PAN masqué → toujours refusé
+    [x] CRITIQUE corrigé : épuisement des retries → aucun reversal (argent perdu)
+    [x] CRITIQUE corrigé : vérification on-chain AVANT reversal (double dépense)
+    [x] CRITIQUE corrigé : lien acquéreur créé dans la boucle de la tâche
+    [x] AJOUT : tâche retry_reversal dédiée + beat_schedule de réconciliation
+
+[x] crypto_service.py
+    [x] CRITIQUE corrigé : signed_tx.rawTransaction n'existe plus en web3 v7
+    [x] CRITIQUE corrigé : nonce via verrou Redis (asyncio.Lock ne sérialise pas
+        4 workers Gunicorn + 4 Celery → nonce dupliqué → transfert écrasé)
+    [x] Corrigé : rotation RPC réelle (pas seulement au démarrage)
+    [x] Corrigé : boucle de confirmation bornée (while True bloquait un worker)
+    [x] AJOUT : broadcast et confirmation séparés — le hash est persisté avant
+        l'attente, un crash ne peut plus orpheliner un transfert déjà en chaîne
+    [x] AJOUT : vérification du chain id, solde vérifié avant envoi, get_onchain_status
+
+[x] database.py / models.py
+    [x] Pooling, SSL, Numeric, index (status, stan, created_at, crypto_tx_hash)
+    [x] Corrigé : create_all désactivé en prod (course entre workers Gunicorn)
+    [x] AJOUT : updated_at, completed_at, rrn, auth_code, reversal_attempts
+    [x] AJOUT : états REVERSAL_FAILED et FIAT_UNKNOWN (l'argent dû à un client
+        doit être un état visible, pas une ligne de log)
+
+[x] acquirer.py
+    [x] STAN Redis, confirmation 0410, support TLS
+    [x] CRITIQUE corrigé : DE90 absent de la config ISO8583 → KeyError → le
+        reversal était mort à 100 %. Champ ajouté dans src/libfin/config.py
+    [x] Corrigé : rollover STAN atomique (deux instances pouvaient le remettre à 1)
+    [x] AJOUT : heartbeat 0800 + réponse 0810 aux échos de l'acquéreur
+    [x] AJOUT : DE22, DE37 (RRN), DE41, DE42, DE12 et CVV — un acquéreur réel
+        refuse un 0200 sans ces champs
+    [x] AJOUT : AuthorizationTimeout distingue « refusé » de « on ne sait pas »
+
+[x] circuit_breaker.py
+    [x] État partagé via Redis
+    [x] CRITIQUE corrigé : Redis indisponible → le breaker se déclarait CLOSED
+        et laissait tout passer, exactement pendant un incident d'infra.
+        Désormais fail-closed en production.
+    [x] Corrigé : appels Redis bloquants sortis de la boucle asyncio
+    [x] AJOUT : transitions atomiques (Lua), TTL sur les compteurs, une seule
+        sonde en HALF_OPEN
+
+[x] src/gateway/pan_vault.py [NOUVEAU]
+    Stockage chiffré et éphémère du PAN, pour que le reversal dispose du vrai
+    numéro sans jamais le faire transiter par Celery.
+
+[x] src/gateway/reconciliation.py [NOUVEAU]
+    Déplacé depuis scripts/ pour être appelable par Celery Beat, et surtout :
+    il RÉPARE maintenant (remise en file, reversal) au lieu de seulement logger.
+
+============================================================================
+Phase 3 : Opérations
+============================================================================
+[x] .env.prod.example — toutes les variables, chaque champ à remplir marqué
+    REPLACE_ME. Corrigé : les commentaires en fin de ligne corrompaient les
+    valeurs (env_file ne les retire pas).
+[x] .env.sim — miroir exact, valeurs qui marchent sans configuration
+[x] scripts/vault_init_prod.sh — n'écrit plus de fausse clé privée
+[x] scripts/preflight_check.sh — placeholders, restes de simulation (clés Anvil
+    publiques, chain id de test), posture de sécurité, certificats, connectivité
+[x] scripts/migrate.py — schéma appliqué explicitement
+[x] Makefile — cibles sim-*, prod-*, db-backup/restore, reconcile, security-audit
+
+============================================================================
+Phase 4 : Simulation permanente  [NOUVEAU]
+============================================================================
+[x] podman-compose.sim.yml — topologie de production complète
+[x] sim/SimToken.sol + deploy_token.sh — vrai ERC-20 sur chaîne locale Anvil,
+    donc signature, nonce, reçu et confirmations réels
+[x] tests/simulator/bank_server.py — scénarios de refus, silence, reversal
+    refusé, réponse lente. Un simulateur qui approuve tout ne teste que le
+    chemin qui ne perd jamais d'argent.
+[x] tests/gateway/ — 16 tests dont les chemins de perte d'argent
+[x] Validation bout-en-bout du stack sim — exécutée, 9 conteneurs, paiement
+    complet TLS → ISO 8583 → Celery → signature → 3 confirmations → jetons
+    reçus (12340000 unités = 12,34 exactement, 6 décimales)
+
+    Trois bugs supplémentaires trouvés PAR la simulation, invisibles en tests
+    unitaires — c'est précisément ce qui justifie de la garder :
+    [x] Le client Redis du coffre PAN restait lié à la première boucle asyncio ;
+        Celery en crée une par tâche → « attached to a different loop » au
+        milieu d'un reversal
+    [x] Idem pour le pool de connexions SQLAlchemy → NullPool sous Celery
+    [x] _select_working_rpc lisait self.private_key avant son affectation ;
+        l'AttributeError était avalée et déguisée en « RPC injoignable »
+    [x] Le cache de nonce Redis pouvait devancer la chaîne (Redis restauré,
+        chaîne réinitialisée) → transaction diffusée jamais minée, impossible
+        à annuler car « pending ». Borne de sécurité ajoutée.
+
+============================================================================
+Reste à faire — non-code, côté humain
+============================================================================
+[ ] URGENT : nginx/ssl/server.key est versionné dans git. Le retirer :
+        git rm --cached nginx/ssl/server.key nginx/ssl/server.crt
+    puis régénérer (make certs). Si le dépôt a déjà été poussé quelque part,
+    considérer la clé comme compromise.
+[ ] Certification de la passerelle par l'acquéreur (obligatoire avant le live)
+[ ] Confirmer avec l'acquéreur : sous-élément DE48 du CVV2, valeur DE22,
+    format DE90, codes d'action de reversal acceptés
+[ ] Alembic avant la première modification d'une colonne contenant des données
+[ ] Brancher EXCHANGE_RATE sur un vrai flux de prix si l'actif n'est pas stable
+[ ] Alerte sur les lignes de log CRITICAL « MANUAL ACTION REQUIRED » — elles
+    signifient qu'un porteur de carte attend un remboursement
+[ ] Surveillance du solde du portefeuille chaud (InsufficientFunds n'est pas
+    réessayable : il déclenche un reversal)

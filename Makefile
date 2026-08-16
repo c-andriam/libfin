@@ -222,6 +222,181 @@ infra-logs: ## Afficher les logs des conteneurs
 	podman-compose logs -f
 
 # ──────────────────────────────────────────────────────────────
+#  Certificats TLS
+# ──────────────────────────────────────────────────────────────
+.PHONY: certs
+certs: ## Générer un certificat TLS auto-signé (nginx/ssl/)
+	./scripts/gen_certs.sh $(or $(CN),localhost)
+
+# ──────────────────────────────────────────────────────────────
+#  SIMULATION — topologie de production, dépendances simulées
+# ──────────────────────────────────────────────────────────────
+#  Même image, même Nginx/TLS, même Gunicorn, même worker Celery
+#  qu'en production. Seuls l'acquéreur et la blockchain sont simulés.
+#  C'est ici qu'on répète la production sans risquer d'argent.
+# ──────────────────────────────────────────────────────────────
+SIM_COMPOSE := podman-compose -f podman-compose.sim.yml --env-file .env.sim
+
+.PHONY: sim-build
+sim-build: ## Construire l'image de simulation
+	podman build -t gateway:sim -f Containerfile.prod .
+
+.PHONY: sim
+sim: certs sim-build ## Lancer la simulation complète (build + up + déploiement du jeton)
+	$(SIM_COMPOSE) up -d
+	@echo ""
+	@echo "  Attente de la chaîne locale et du déploiement du jeton..."
+	@$(SIM_COMPOSE) logs gateway-token-deployer 2>/dev/null | tail -5 || true
+	@echo ""
+	@echo "  ✔ Simulation lancée."
+	@echo "    API      : https://localhost:8443  (certificat auto-signé → curl -k)"
+	@echo "    Clé API  : voir GATEWAY_API_KEY dans .env.sim"
+	@echo "    Cartes   : 4111111111111111 approuvée · 4000000000000002 refusée"
+	@echo "               4000000000000028 sans réponse · 4000000000000036 reversal refusé"
+	@echo ""
+	@echo "    Tester   : make sim-pay"
+	@echo "    Vérifier : make sim-status"
+
+.PHONY: sim-up
+sim-up: ## Démarrer la simulation sans reconstruire
+	$(SIM_COMPOSE) up -d
+
+.PHONY: sim-down
+sim-down: ## Arrêter la simulation et supprimer ses volumes
+	$(SIM_COMPOSE) down -v
+
+.PHONY: sim-logs
+sim-logs: ## Suivre les logs de la simulation
+	$(SIM_COMPOSE) logs -f
+
+.PHONY: sim-status
+sim-status: ## État des conteneurs de simulation
+	$(SIM_COMPOSE) ps
+	@echo ""
+	@curl -sk https://localhost:8443/health | head -5 || echo "  API injoignable"
+
+.PHONY: sim-pay
+sim-pay: ## Envoyer un paiement de test à travers toute la chaîne
+	@echo "  Paiement de test (carte approuvée)..."
+	@curl -sk -X POST https://localhost:8443/pay \
+		-H "Content-Type: application/json" \
+		-H "X-API-Key: simulation-api-key-not-a-secret" \
+		-H "Idempotency-Key: make-sim-$$(date +%s)" \
+		-d '{"pan":"4111111111111111","expiry":"3012","cvv":"123","amount":"25.00","target_wallet":"0x742d35Cc6634C0532925a3b844Bc454e4438f44e"}' \
+		| python3 -m json.tool || true
+	@echo ""
+	@echo "  Suivre le transfert crypto : make sim-logs"
+
+.PHONY: sim-decline
+sim-decline: ## Tester le refus bancaire (aucun crypto ne doit partir)
+	@curl -sk -X POST https://localhost:8443/pay \
+		-H "Content-Type: application/json" \
+		-H "X-API-Key: simulation-api-key-not-a-secret" \
+		-H "Idempotency-Key: make-dec-$$(date +%s)" \
+		-d '{"pan":"4000000000000002","expiry":"3012","cvv":"123","amount":"25.00","target_wallet":"0x742d35Cc6634C0532925a3b844Bc454e4438f44e"}' \
+		| python3 -m json.tool || true
+
+.PHONY: sim-reconcile
+sim-reconcile: ## Lancer la réconciliation à blanc dans la simulation
+	$(SIM_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
+
+# ──────────────────────────────────────────────────────────────
+#  PRODUCTION
+# ──────────────────────────────────────────────────────────────
+PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file .env.prod
+
+.PHONY: prod-build
+prod-build: ## Construire l'image de production
+	podman build -t gateway:prod -f Containerfile.prod .
+
+.PHONY: prod-preflight
+prod-preflight: ## Vérifier que tout est prêt (bloque si non)
+	./scripts/preflight_check.sh
+
+.PHONY: prod-migrate
+prod-migrate: ## Appliquer le schéma de base de données
+	$(PROD_COMPOSE) run --rm gateway-api python /app/scripts/migrate.py
+
+.PHONY: prod
+prod: prod-preflight prod-build ## Lancer la production (preflight → build → migrate → up)
+	$(PROD_COMPOSE) up -d gateway-postgres gateway-redis gateway-vault
+	@echo "  Attente des services de données..."
+	@sleep 10
+	$(MAKE) prod-migrate
+	$(PROD_COMPOSE) up -d
+	@echo ""
+	@echo "  ✔ Production lancée."
+	@echo "    Si Vault vient de redémarrer : make prod-vault-unseal"
+	@echo "    Vérifier l'état             : make prod-status"
+
+.PHONY: prod-down
+prod-down: ## Arrêter la production (volumes conservés)
+	$(PROD_COMPOSE) down
+
+.PHONY: prod-logs
+prod-logs: ## Suivre les logs de production
+	$(PROD_COMPOSE) logs -f
+
+.PHONY: prod-status
+prod-status: ## État des conteneurs et santé applicative
+	$(PROD_COMPOSE) ps
+	@echo ""
+	@$(PROD_COMPOSE) exec -T gateway-api curl -sf http://127.0.0.1:8000/health || echo "  API injoignable"
+
+.PHONY: prod-vault-init
+prod-vault-init: ## Initialiser Vault en production (une seule fois)
+	$(PROD_COMPOSE) exec -T gateway-vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault operator init -key-shares=5 -key-threshold=3'
+	@echo ""
+	@echo "  ⚠  Conservez les clés de descellement et le token racine hors ligne."
+	@echo "     Sans elles, les secrets sont irrécupérables."
+
+.PHONY: prod-vault-unseal
+prod-vault-unseal: ## Desceller Vault (requis après chaque redémarrage)
+	@echo "  Saisissez 3 clés de descellement, une par exécution :"
+	$(PROD_COMPOSE) exec gateway-vault sh -c 'VAULT_ADDR=http://127.0.0.1:8200 vault operator unseal'
+
+.PHONY: prod-vault-secrets
+prod-vault-secrets: ## Enregistrer les secrets applicatifs dans Vault
+	./scripts/vault_init_prod.sh
+
+# ──────────────────────────────────────────────────────────────
+#  Exploitation
+# ──────────────────────────────────────────────────────────────
+BACKUP_DIR ?= backups
+
+.PHONY: db-backup
+db-backup: ## Sauvegarder la base de production
+	@mkdir -p $(BACKUP_DIR)
+	$(PROD_COMPOSE) exec -T gateway-postgres pg_dump -U gateway -d gateway_db --format=custom \
+		> $(BACKUP_DIR)/gateway_$$(date +%Y%m%d_%H%M%S).dump
+	@echo "  ✔ Sauvegarde écrite dans $(BACKUP_DIR)/"
+	@ls -lh $(BACKUP_DIR)/ | tail -3
+
+.PHONY: db-restore
+db-restore: ## Restaurer une sauvegarde (DUMP=chemin/vers/fichier.dump)
+	@test -n "$(DUMP)" || { echo "  Usage: make db-restore DUMP=backups/gateway_....dump"; exit 1; }
+	@test -f "$(DUMP)" || { echo "  Fichier introuvable: $(DUMP)"; exit 1; }
+	@echo "  ⚠  Cette opération écrase la base de production."
+	@read -p "  Confirmer ? [y/N] " c && [ "$$c" = "y" ] || exit 1
+	$(PROD_COMPOSE) exec -T gateway-postgres pg_restore -U gateway -d gateway_db --clean --if-exists < $(DUMP)
+	@echo "  ✔ Restauration terminée"
+
+.PHONY: reconcile
+reconcile: ## Réconcilier la base et la chaîne (production)
+	$(PROD_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py
+
+.PHONY: reconcile-dry
+reconcile-dry: ## Réconciliation en lecture seule (production)
+	$(PROD_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
+
+.PHONY: security-audit
+security-audit: ## Analyse statique de sécurité et audit des dépendances
+	@command -v bandit >/dev/null || $(PIP) install bandit
+	@command -v pip-audit >/dev/null || $(PIP) install pip-audit
+	-bandit -r $(SRC_DIR)/gateway -ll
+	-pip-audit -r requirements-prod.txt
+
+# ──────────────────────────────────────────────────────────────
 #  Raccourcis
 # ──────────────────────────────────────────────────────────────
 .PHONY: all
