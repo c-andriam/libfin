@@ -177,6 +177,19 @@ class AcquirerService:
         )
 
     @staticmethod
+    def _encode(message: Dict[str, Any]) -> bytes:
+        """Serialise using the acquirer's dialect.
+
+        Bitmap format and character encoding are per-acquirer. Hard-coding the
+        library defaults meant the choice was never anyone's decision.
+        """
+        return iso8583.dumps(
+            message,
+            encoding=settings.acquirer_encoding,
+            hex_bitmap=settings.acquirer_hex_bitmap,
+        )
+
+    @staticmethod
     def _original_data_elements(mti: str, stan: str, sent_at: datetime) -> str:
         """DE90, n42: original MTI, STAN, transmission time and institution ids."""
         return (
@@ -191,7 +204,11 @@ class AcquirerService:
 
     async def _handle_incoming_message(self, msg_bytes: bytes) -> None:
         try:
-            msg = iso8583.loads(msg_bytes)
+            msg = iso8583.loads(
+                msg_bytes,
+                encoding=settings.acquirer_encoding,
+                hex_bitmap=settings.acquirer_hex_bitmap,
+            )
         except Exception as exc:
             LOGGER.error(f"Undecodable message from the acquirer: {exc}")
             return
@@ -216,7 +233,7 @@ class AcquirerService:
         response["MTI"] = "0810"
         response["DE39"] = "00"
         try:
-            await self.client.send(iso8583.dumps(response))
+            await self.client.send(self._encode(response))
             LOGGER.debug("Answered an acquirer echo (0800 -> 0810).")
         except Exception as exc:
             LOGGER.error(f"Could not answer the acquirer echo: {exc}")
@@ -230,7 +247,7 @@ class AcquirerService:
         future = asyncio.get_running_loop().create_future()
         self._pending_requests[stan] = future
         try:
-            await self.client.send(iso8583.dumps(request))
+            await self.client.send(self._encode(request))
             return await asyncio.wait_for(future, timeout or settings.bank_timeout_sec)
         finally:
             self._pending_requests.pop(stan, None)
@@ -260,7 +277,7 @@ class AcquirerService:
         }
         # DE70 is not in every dialect; drop it rather than fail the heartbeat.
         try:
-            iso8583.dumps(request)
+            self._encode(request)
         except Exception:
             request.pop("DE70", None)
 

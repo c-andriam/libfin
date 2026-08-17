@@ -24,6 +24,7 @@ special-cased inside the gateway.
 import asyncio
 import logging
 import os
+import ssl
 import sys
 from datetime import datetime, timezone
 
@@ -39,6 +40,20 @@ logging.basicConfig(
 LOGGER = logging.getLogger("bank-simulator")
 
 APPROVED = "00"
+
+# Match the gateway's dialect so the simulator exercises the same encoding the
+# acquirer will see, not merely the library defaults.
+HEX_BITMAP = os.environ.get("SIM_HEX_BITMAP", "").lower() in ("1", "true", "yes")
+ENCODING = os.environ.get("SIM_ENCODING", "latin_1")
+
+
+def dumps(message: dict) -> bytes:
+    return iso8583.dumps(message, encoding=ENCODING, hex_bitmap=HEX_BITMAP)
+
+
+def loads(raw: bytes) -> dict:
+    return iso8583.loads(raw, encoding=ENCODING, hex_bitmap=HEX_BITMAP)
+
 
 # PAN -> (action code, behaviour)
 SCENARIOS = {
@@ -90,7 +105,7 @@ async def _handle_authorization(msg: dict) -> bytes:
         LOGGER.info(f"STAN={stan}: declined with {action_code}.")
 
     # An acquirer echoes the retrieval reference number back untouched.
-    return iso8583.dumps(response)
+    return dumps(response)
 
 
 async def _handle_reversal(msg: dict) -> bytes:
@@ -117,7 +132,7 @@ async def _handle_reversal(msg: dict) -> bytes:
         LOGGER.info(f"STAN={stan}: reversal of {original_stan} accepted.")
         response["DE39"] = APPROVED
 
-    return iso8583.dumps(response)
+    return dumps(response)
 
 
 async def _handle_echo(msg: dict) -> bytes:
@@ -125,12 +140,12 @@ async def _handle_echo(msg: dict) -> bytes:
     response["MTI"] = "0810"
     response["DE39"] = APPROVED
     LOGGER.debug(f"Echo answered (STAN={msg.get('DE11')}).")
-    return iso8583.dumps(response)
+    return dumps(response)
 
 
 async def handle_message(msg_bytes: bytes) -> bytes:
     try:
-        msg = iso8583.loads(msg_bytes)
+        msg = loads(msg_bytes)
     except Exception as exc:
         LOGGER.error(f"Undecodable message: {exc}")
         return b""
@@ -164,11 +179,31 @@ async def _echo_probe(server_ready: asyncio.Event) -> None:
         )
 
 
+def _build_ssl_context():
+    """Serve over TLS when asked.
+
+    Production requires BANK_USE_TLS=true, so a plaintext-only simulator leaves
+    the encrypted acquirer path — certificates, handshake, framing over TLS —
+    completely unexercised until the day it faces a real bank.
+    """
+    if os.environ.get("SIM_USE_TLS", "").lower() not in ("1", "true", "yes"):
+        return None
+
+    cert = os.environ.get("SIM_TLS_CERT", "/certs/server.crt")
+    key = os.environ.get("SIM_TLS_KEY", "/certs/server.key")
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(cert, key)
+    LOGGER.info(f"TLS enabled using {cert}")
+    return context
+
+
 async def main() -> None:
     host = os.environ.get("SIM_HOST", "0.0.0.0")
     port = int(os.environ.get("SIM_PORT", "9000"))
 
-    server = Iso8583Server(host, port, handle_message, length_header_size=2)
+    server = Iso8583Server(
+        host, port, handle_message, length_header_size=2, ssl_context=_build_ssl_context()
+    )
     LOGGER.info(f"Mock acquirer listening on {host}:{port}")
     LOGGER.info("Scenario cards: " + ", ".join(f"{p}={b[1]}" for p, b in SCENARIOS.items()))
     await server.start()

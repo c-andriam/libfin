@@ -30,6 +30,13 @@ os.environ.setdefault("AMOUNT_MIN", "0.01")
 # The rate limiter keys on the client address, which is the same for every test
 # in this file. Raise the ceiling so it does not leak between them.
 os.environ.setdefault("RATE_LIMIT_PER_MINUTE", "1000")
+# The gateway refuses payments it could not settle, so the test environment
+# must represent one that can sign. Anvil's published account #1 — worthless
+# on any real network, which is the point.
+os.environ.setdefault(
+    "WEB3_PRIVATE_KEY",
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+)
 
 # ── Redis ───────────────────────────────────────────────────────────────────
 import fakeredis  # noqa: E402

@@ -1,0 +1,56 @@
+# ============================================================================
+#  Overlay: the production stack, against a real chain.
+# ============================================================================
+#  Used together with podman-compose.prod.yml, which is not modified:
+#
+#      podman-compose -f podman-compose.prod.yml \
+#                     -f podman-compose.prodtest.yml \
+#                     --env-file .env.prodtest up -d
+#
+#  What is real here: the production compose, the production image, Gunicorn,
+#  Nginx with TLS, the network segmentation, Vault in production mode, Postgres
+#  with SSL — and a real public blockchain, with real gas, real block times,
+#  real confirmations and a real RPC provider.
+#
+#  What is still simulated: the acquirer. There is no public ISO 8583 test host
+#  anywhere; those environments sit behind a contract with an acquirer or
+#  membership of a card scheme. So the simulator stands in — but over TLS, the
+#  way production talks to a real bank, rather than in plaintext.
+#
+#  This is the closest rehearsal possible without a commercial relationship.
+# ============================================================================
+
+services:
+  bank-simulator:
+    image: gateway:prod
+    container_name: gateway-bank-prodtest
+    restart: unless-stopped
+    command: ["python", "/app/tests/simulator/bank_server.py"]
+    environment:
+      SIM_LOG_LEVEL: INFO
+      SIM_SLOW_DELAY: "15"
+      # The acquirer link is encrypted, as production requires. The gateway
+      # side sets BANK_USE_TLS=true and BANK_TLS_INSECURE=true, because this
+      # certificate is self-signed — a real acquirer's is not, and preflight
+      # refuses BANK_TLS_INSECURE in a genuine production launch.
+      SIM_USE_TLS: "true"
+      SIM_TLS_CERT: /certs/bank.crt
+      SIM_TLS_KEY: /certs/bank.key
+    volumes:
+      - ./tests/simulator:/app/tests/simulator:ro,z
+      - ./acquirer-certs:/certs:ro,z
+    networks:
+      # Reachable by the API (frontend-net) and by the worker, which sends
+      # reversals from egress-net.
+      - frontend-net
+      - egress-net
+
+  # The API and the worker both open the acquirer link, so both need the CA
+  # that signs the simulator's certificate.
+  gateway-api:
+    volumes:
+      - ./acquirer-certs:/certs:ro,z
+
+  gateway-worker:
+    volumes:
+      - ./acquirer-certs:/certs:ro,z

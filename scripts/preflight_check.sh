@@ -110,6 +110,13 @@ fi
 # ── 4. Security posture ─────────────────────────────────────────────────────
 section "Security posture"
 
+if [[ "${ALLOW_SIMULATED_ACQUIRER:-false}" == "true" ]]; then
+    block "ALLOW_SIMULATED_ACQUIRER=true. That flag exists only for rehearsals \
+against the simulator; a system serving real cardholders must never carry it. Remove it."
+else
+    pass "No simulated-acquirer escape hatch is set."
+fi
+
 [[ "${GATEWAY_MODE:-}" == "production" ]] \
     && pass "GATEWAY_MODE=production." \
     || block "GATEWAY_MODE must be 'production' (currently '${GATEWAY_MODE:-unset}')."
@@ -301,6 +308,50 @@ command -v podman >/dev/null 2>&1 \
 command -v podman-compose >/dev/null 2>&1 || podman compose version >/dev/null 2>&1 \
     && pass "A compose implementation is available." \
     || block "Neither podman-compose nor 'podman compose' is available."
+
+# Rootless podman cannot bind below 1024, and the failure appears only when
+# the nginx container starts — after everything else is already up.
+HTTP_PORT="${HTTP_PORT:-80}"
+HTTPS_PORT="${HTTPS_PORT:-443}"
+UNPRIV_START="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+IS_ROOTFUL=0
+[[ "$(id -u)" == "0" ]] && IS_ROOTFUL=1
+podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q false && IS_ROOTFUL=1
+
+if (( IS_ROOTFUL )); then
+    pass "Running rootful; privileged ports are available."
+elif (( HTTP_PORT < UNPRIV_START || HTTPS_PORT < UNPRIV_START )); then
+    block "Rootless podman cannot bind ports ${HTTP_PORT}/${HTTPS_PORT} (the host allows \
+from ${UNPRIV_START}). Either set HTTP_PORT/HTTPS_PORT above ${UNPRIV_START} and redirect \
+to them, or raise net.ipv4.ip_unprivileged_port_start, or run rootful."
+else
+    pass "Ports ${HTTP_PORT}/${HTTPS_PORT} are bindable rootless."
+fi
+
+# A network that already exists is adopted with its current options, so
+# `internal: true` in the compose file can be silently inert.
+if podman network inspect gateway-prod-backend >/dev/null 2>&1; then
+    if [[ "$(podman network inspect gateway-prod-backend --format '{{.Internal}}' 2>/dev/null)" == "true" ]]; then
+        pass "gateway-prod-backend is internal; the datastores have no route out."
+    else
+        block "The network gateway-prod-backend exists but is NOT internal. Podman adopts \
+an existing network as-is, so the compose file's 'internal: true' is being ignored and \
+Postgres, Redis and Vault can reach the internet. Remove it: podman network rm gateway-prod-backend"
+    fi
+else
+    info "gateway-prod-backend does not exist yet; it will be created internal."
+fi
+
+# Vault with mlock disabled may be swapped to disk.
+if [[ "${VAULT_DISABLE_MLOCK:-true}" == "true" ]]; then
+    if command -v swapon >/dev/null 2>&1 && [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+        warn "VAULT_DISABLE_MLOCK=true and this host has swap enabled: Vault's memory, \
+including the hot wallet key, can be written to disk. Disable or encrypt swap, or run \
+rootful with VAULT_DISABLE_MLOCK=false."
+    else
+        pass "Vault memory locking is off, but the host has no swap."
+    fi
+fi
 
 AVAILABLE_KB="$(df -Pk . | awk 'NR==2 {print $4}')"
 if (( AVAILABLE_KB < 5242880 )); then

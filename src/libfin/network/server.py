@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from typing import Callable, Awaitable
+import ssl
+from typing import Awaitable, Callable, Optional
 
 from libfin.network.protocol import Iso8583Protocol
 
@@ -13,16 +14,29 @@ class Iso8583Server:
     """
     Asyncio TCP server for receiving and responding to ISO8583 messages.
     """
-    def __init__(self, host: str, port: int, handler: MessageHandler, length_header_size: int = 2):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        handler: MessageHandler,
+        length_header_size: int = 2,
+        ssl_context: Optional[ssl.SSLContext] = None,
+    ):
         self.host = host
         self.port = port
         self.handler = handler
         self.protocol = Iso8583Protocol(length_header_size)
+        self.ssl_context = ssl_context
         self._server = None
 
     async def start(self):
-        self._server = await asyncio.start_server(self.handle_client, self.host, self.port)
-        LOGGER.info(f"Server started at {self.host}:{self.port}")
+        self._server = await asyncio.start_server(
+            self.handle_client, self.host, self.port, ssl=self.ssl_context
+        )
+        LOGGER.info(
+            f"Server started at {self.host}:{self.port}"
+            f"{' with TLS' if self.ssl_context else ''}"
+        )
 
     async def stop(self):
         if self._server:

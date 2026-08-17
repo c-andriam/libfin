@@ -75,6 +75,23 @@ class Settings:
         # ── Infrastructure ──────────────────────────────────────────────────
         self.database_url: str = _env("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
         self.database_ssl: bool = _env_bool("DATABASE_SSL", self.is_production)
+        #: How far to trust the database's certificate.
+        #:   disable      no TLS
+        #:   require      encrypt, do not verify the certificate
+        #:   verify-full  encrypt and verify against DATABASE_SSL_CA_FILE
+        #: `ssl: True` in asyncpg means verify-full, which fails against the
+        #: self-signed certificate the bundled Postgres uses — so the mode has
+        #: to be a decision, not a side effect.
+        self.database_ssl_mode: str = _env(
+            "DATABASE_SSL_MODE", "require" if self.database_ssl else "disable"
+        ).lower()
+        self.database_ssl_ca_file: str = _env("DATABASE_SSL_CA_FILE")
+        # Applied in every mode, so a load test in simulation exercises the
+        # pool production will actually run. Postgres' own max_connections must
+        # exceed (pool_size + max_overflow) x number of API workers.
+        self.db_pool_size: int = _env_int("DB_POOL_SIZE", 10)
+        self.db_max_overflow: int = _env_int("DB_MAX_OVERFLOW", 10)
+        self.db_pool_timeout: int = _env_int("DB_POOL_TIMEOUT", 10)
         self.redis_url: str = _env("REDIS_URL", "redis://localhost:6379/0")
         self.celery_broker_url: str = _env("CELERY_BROKER_URL", self.redis_url)
         self.vault_addr: str = _env("VAULT_ADDR")
@@ -101,6 +118,15 @@ class Settings:
         self.acquirer_pos_data: str = _env("ACQUIRER_POS_DATA", "810101Y00000")
         self.acquirer_processing_code: str = _env("ACQUIRER_PROCESSING_CODE", "000000")
         self.acquirer_send_cvv: bool = _env_bool("ACQUIRER_SEND_CVV", True)
+        #: Bitmap encoding on the wire. ISO 8583 permits both; which one your
+        #: acquirer expects is part of their dialect, and getting it wrong means
+        #: every message is rejected as unparseable. Cross-checking libfin
+        #: against an independent implementation is what surfaced this as a
+        #: decision rather than a default nobody had looked at.
+        self.acquirer_hex_bitmap: bool = _env_bool("ACQUIRER_HEX_BITMAP", False)
+        #: Message encoding. latin_1 for ASCII hosts, cp500 for EBCDIC ones
+        #: (still common on mainframe-backed acquirers).
+        self.acquirer_encoding: str = _env("ACQUIRER_ENCODING", "latin_1")
 
         # ── Web3 ────────────────────────────────────────────────────────────
         rpc_urls = [
@@ -112,6 +138,16 @@ class Settings:
             _env_int("WEB3_CHAIN_ID", 0) or None
         )
         self.web3_confirmations: int = _env_int("WEB3_CONFIRMATIONS", 2)
+        #: Absolute ceiling on maxFeePerGas, in gwei. Without one, a fee spike
+        #: is paid in full and a small transfer can cost more than it moves.
+        #: Exceeding it is treated as temporary: the transfer waits for calmer
+        #: fees, and is refunded if they never come.
+        self.web3_max_fee_gwei: Decimal = _env_decimal("WEB3_MAX_FEE_GWEI", "200")
+        #: Multiplier applied when replacing a transaction stuck in the
+        #: mempool. Below ~1.1 the network rejects the replacement outright.
+        self.web3_replacement_multiplier: Decimal = _env_decimal(
+            "WEB3_REPLACEMENT_MULTIPLIER", "1.25"
+        )
         self.web3_receipt_timeout_sec: int = _env_int("WEB3_RECEIPT_TIMEOUT_SEC", 180)
         self.web3_confirmation_timeout_sec: int = _env_int("WEB3_CONFIRMATION_TIMEOUT_SEC", 600)
         self.web3_private_key: str = _env("WEB3_PRIVATE_KEY")
@@ -126,7 +162,13 @@ class Settings:
             o.strip() for o in _env("CORS_ORIGINS", "*").split(",") if o.strip()
         ]
         self.rate_limit_per_minute: int = _env_int("RATE_LIMIT_PER_MINUTE", 5)
-        self.trusted_proxies: str = _env("TRUSTED_PROXIES", "*")
+        #: Addresses or CIDR blocks whose ``X-Forwarded-For`` may be believed.
+        #: "*" trusts any peer, which is only safe when nothing but your own
+        #: proxy can reach the API port — otherwise a client forges the header
+        #: and walks around the rate limit.
+        self.trusted_proxies: List[str] = [
+            p.strip() for p in _env("TRUSTED_PROXIES", "*").split(",") if p.strip()
+        ]
         self.amount_min: Decimal = _env_decimal("AMOUNT_MIN", "1.00")
         self.amount_max: Decimal = _env_decimal("AMOUNT_MAX", "10000.00")
 
@@ -145,6 +187,12 @@ class Settings:
         self.stale_transaction_minutes: int = _env_int("STALE_TRANSACTION_MINUTES", 15)
         # create_all is convenient in simulation; production uses migrations.
         self.auto_create_schema: bool = _env_bool("AUTO_CREATE_SCHEMA", not self.is_production)
+        #: Permits a production-mode run against a simulated acquirer, for
+        #: rehearsals. There is no public ISO 8583 test host to point at, so the
+        #: alternative would be never exercising the production configuration at
+        #: all. scripts/preflight_check.sh refuses this outright, so it cannot
+        #: reach a system that serves real cardholders.
+        self.allow_simulated_acquirer: bool = _env_bool("ALLOW_SIMULATED_ACQUIRER", False)
 
     # ── Derived properties ──────────────────────────────────────────────────
 
@@ -211,7 +259,19 @@ class Settings:
         # Guard against launching production against simulation infrastructure.
         sim_markers = ("bank-simulator", "anvil", "hardhat", "localhost", "127.0.0.1")
         if any(marker == self.bank_host for marker in sim_markers):
-            problems.append(f"BANK_HOST={self.bank_host} is a simulation host.")
+            if self.allow_simulated_acquirer:
+                # A rehearsal: production everywhere except the bank, because no
+                # public ISO 8583 test host exists to point at. The escape hatch
+                # is deliberately narrow — it excuses this one check and nothing
+                # else — and preflight refuses it outright, so it cannot survive
+                # into a real launch.
+                LOGGER.critical(
+                    f"ALLOW_SIMULATED_ACQUIRER is set: talking to {self.bank_host}, "
+                    "which is a simulator. No real card is being charged. This must "
+                    "never be set on a system serving real cardholders."
+                )
+            else:
+                problems.append(f"BANK_HOST={self.bank_host} is a simulation host.")
         if any(marker in url for url in self.web3_rpc_urls for marker in ("anvil", "hardhat")):
             problems.append("WEB3_RPC_URL points at a local test chain.")
         if self.web3_chain_id in (31337, 1337):

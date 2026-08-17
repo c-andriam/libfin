@@ -26,7 +26,7 @@ from celery.schedules import crontab  # noqa: F401  (available for custom schedu
 from gateway.acquirer import AcquirerService
 from gateway.circuit_breaker import web3_circuit_breaker
 from gateway.config import settings
-from gateway.crypto_service import CryptoService, InsufficientFunds
+from gateway.crypto_service import CryptoService, GasPriceTooHigh, InsufficientFunds
 from gateway.database import async_session
 from gateway.models import Transaction, TransactionStatus
 from gateway.pan_vault import get_pan_vault
@@ -34,6 +34,12 @@ from gateway.pan_vault import get_pan_vault
 LOGGER = logging.getLogger(__name__)
 
 celery_app = Celery("gateway_worker", broker=settings.celery_broker_url)
+
+#: Longest a single transfer attempt can legitimately take: waiting for the
+#: receipt, then for confirmations, plus room for the acquirer round trip.
+_MAX_TASK_SECONDS = (
+    settings.web3_receipt_timeout_sec + settings.web3_confirmation_timeout_sec + 120
+)
 
 celery_app.conf.update(
     task_acks_late=True,
@@ -43,6 +49,22 @@ celery_app.conf.update(
     broker_connection_retry_on_startup=True,
     result_expires=3600,
     timezone="UTC",
+    broker_transport_options={
+        # With a Redis broker, `acks_late` alone does not recover a killed
+        # worker: the task stays invisible until the visibility timeout expires,
+        # and Celery's default is one hour. A customer whose fiat was captured
+        # would wait that long for their crypto. Sized just above the longest a
+        # task can legitimately run — shorter would redeliver tasks that are
+        # still working, longer would strand them after a crash.
+        #
+        # Redelivery is safe here because process_crypto_transfer is
+        # idempotent: it reads any hash already persisted and asks the chain
+        # what happened before doing anything.
+        "visibility_timeout": _MAX_TASK_SECONDS,
+    },
+    # A task stuck beyond its own budget is killed rather than held forever.
+    task_soft_time_limit=_MAX_TASK_SECONDS,
+    task_time_limit=_MAX_TASK_SECONDS + 60,
     beat_schedule={
         "reconcile-transactions": {
             "task": "reconcile_transactions",
@@ -53,6 +75,9 @@ celery_app.conf.update(
 
 MAX_TRANSFER_RETRIES = 5
 MAX_REVERSAL_RETRIES = 10
+#: How many times a stuck transfer may be re-priced before we give up and
+#: refund. Each replacement raises the fee, so this bounds the spend.
+MAX_REPLACEMENTS = 3
 
 #: Errors worth retrying: the network was in the way, the request itself is fine.
 _TRANSIENT_MARKERS = (
@@ -73,6 +98,9 @@ _TRANSIENT_MARKERS = (
 def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, InsufficientFunds):
         return False
+    if isinstance(exc, GasPriceTooHigh):
+        # Fees come back down. Retrying is right; paying any price is not.
+        return True
     if isinstance(exc, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
         return True
     message = str(exc).lower()
@@ -216,6 +244,9 @@ async def _process_crypto(tx_id: int, attempts_left: int) -> str:
                 return "noop"
 
             existing_hash = tx.crypto_tx_hash
+            existing_nonce = tx.crypto_nonce
+            existing_units = int(tx.crypto_amount_units) if tx.crypto_amount_units else None
+            replacements = tx.crypto_replacements or 0
             amount = Decimal(str(tx.amount))
             target_wallet = tx.target_wallet
 
@@ -236,13 +267,44 @@ async def _process_crypto(tx_id: int, attempts_left: int) -> str:
                     await pan_vault.purge(tx_id)
                     web3_circuit_breaker.record_success()
                     return "sent"
+                except TimeoutError as exc:
+                    # Stuck, not failing: priced below the market and sitting in
+                    # the mempool. It can neither be delivered nor reversed
+                    # (the reversal guard rightly refuses to refund something
+                    # still in flight), so the only way out is to replace it at
+                    # the same nonce with higher fees.
+                    if (
+                        existing_nonce is not None
+                        and existing_units
+                        and replacements < MAX_REPLACEMENTS
+                        and attempts_left > 0
+                    ):
+                        LOGGER.warning(
+                            f"Transfer {existing_hash} is stuck; replacing at nonce "
+                            f"{existing_nonce} (attempt {replacements + 1}/{MAX_REPLACEMENTS})."
+                        )
+                        try:
+                            new_hash = await crypto.replace_stuck_transfer(
+                                token_address=settings.erc20_token_address,
+                                to_address=target_wallet,
+                                token_units=existing_units,
+                                nonce=existing_nonce,
+                            )
+                            await _record_replacement(tx_id, new_hash)
+                            return "retry"
+                        except Exception as replace_exc:
+                            LOGGER.error(
+                                f"Could not replace the stuck transfer for {tx_id}: {replace_exc}"
+                            )
+                    LOGGER.warning(f"Pending transfer {existing_hash} not confirmed yet: {exc}")
+                    return "retry" if attempts_left > 0 else await _fail(tx_id, str(exc))
                 except Exception as exc:
                     LOGGER.warning(f"Pending transfer {existing_hash} not confirmed yet: {exc}")
                     return "retry" if attempts_left > 0 else await _fail(tx_id, str(exc))
             # "failed" or "unknown": fall through and try again with a new nonce.
             LOGGER.warning(f"Previous transfer {existing_hash} did not land; retrying.")
 
-        tx_hash, units = await crypto.broadcast_erc20_transfer(
+        tx_hash, units, nonce = await crypto.broadcast_erc20_transfer(
             token_address=settings.erc20_token_address,
             to_address=target_wallet,
             amount_fiat=amount,
@@ -254,6 +316,7 @@ async def _process_crypto(tx_id: int, attempts_left: int) -> str:
             tx = await session.get(Transaction, tx_id)
             tx.crypto_tx_hash = tx_hash
             tx.crypto_amount_units = units
+            tx.crypto_nonce = nonce
             await session.commit()
 
         await crypto.await_confirmation(tx_hash)
@@ -275,6 +338,16 @@ async def _process_crypto(tx_id: int, attempts_left: int) -> str:
 
     finally:
         await crypto.close()
+
+
+async def _record_replacement(tx_id: int, new_hash: str) -> None:
+    """Point the transaction at the replacement. The old hash can never mine."""
+    async with async_session() as session:
+        tx = await session.get(Transaction, tx_id)
+        if tx is not None:
+            tx.crypto_tx_hash = new_hash
+            tx.crypto_replacements = (tx.crypto_replacements or 0) + 1
+            await session.commit()
 
 
 async def _mark_sent(tx_id: int) -> None:

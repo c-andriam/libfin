@@ -143,6 +143,224 @@ Phase 4 : Simulation permanente  [NOUVEAU]
         à annuler car « pending ». Borne de sécurité ajoutée.
 
 ============================================================================
+Phase 5 : Robustesse mesurée  [17/08/2026]
+============================================================================
+Trois angles que les tests unitaires ne peuvent pas couvrir. Chacun a trouvé
+des défauts réels — c'est leur justification.
+
+[x] tests/load/concurrency_test.py — contention réelle
+    100 paiements simultanés : 100 STANs distincts, 100 hashes distincts,
+    100 réglés, solde exact. Le verrou de nonce distribué tient.
+    Défaut trouvé : /pay gardait une connexion base ouverte pendant tout
+    l'aller-retour bancaire (jusqu'à 10 s). Le pool s'épuisait et 14 requêtes
+    sur 60 mouraient en 500 après 30 s d'attente. Un pic de trafic devenait
+    une panne. Sessions courtes désormais : 60/60 en 4 s au lieu de 46/60
+    en 31,7 s.
+    Défaut trouvé : les réglages de pool ne s'appliquaient qu'en production,
+    donc la simulation ne pouvait pas reproduire le problème. Un banc d'essai
+    doit être fidèle sur les axes qui cassent sous charge.
+
+[x] tests/load/chaos_test.py — injection de pannes
+    6 scénarios, invariant vérifié : fiat encaissé ⇒ crypto livrée, OU client
+    remboursé, OU un humain est nommé dans les logs.
+      bank-down · chain-down · insufficient-funds · reversal-refused
+      worker-killed · redis-down
+    Défaut trouvé : le worker tué en plein transfert restait bloqué. Avec un
+    broker Redis, acks_late ne redélivre qu'après le visibility_timeout, dont
+    le défaut Celery est d'UNE HEURE. Un client débité aurait attendu tout ce
+    temps. Calé sur la durée réelle maximale d'une tâche.
+    Défaut trouvé : la sonde de santé du worker interrogeait celery@$HOSTNAME,
+    or $HOSTNAME est vide dans un shell non interactif — tous les workers
+    étaient marqués unhealthy. Avec restart:always, redémarrages en boucle
+    tuant des transferts en vol.
+    Défaut trouvé : le seuil « transaction bloquée » pouvait être plus court
+    que la durée d'une tâche, produisant des remises en file redondantes.
+
+[x] tests/load/testnet_check.py — vraie chaîne publique (Sepolia)
+    Identité de chaîne, refus de signer sur la mauvaise chaîne, marché des
+    frais réel, lecture d'un vrai ERC-20, cadence des blocs, recherche de
+    reçus, rotation de fournisseur, limitation de débit. Tout passe.
+    Non couvert : la diffusion, qui exige une clé approvisionnée (un robinet
+    de testnet demande un humain).
+    Défaut trouvé : le délai HTTP de 30 s s'appliquait aussi aux simples
+    tests de disponibilité. Sur six tentatives contre un nœud mort, ça
+    dominait tout : 251 s avant remboursement au lieu de 84 s.
+
+[x] Améliorations appliquées après ces tests
+    [x] Plafond absolu de gas (WEB3_MAX_FEE_GWEI) — un pic de frais ne peut
+        plus coûter plus cher que la somme transférée. Traité comme temporaire.
+    [x] Remplacement d'une transaction coincée : même nonce, frais relevés.
+        Sans ça, une transaction sous-tarifée n'est ni livrable ni annulable
+        (le garde-fou la voit « en attente »).
+    [x] TRUSTED_PROXIES vérifie réellement l'IP source (adresses et CIDR).
+        Avant, l'en-tête X-Forwarded-For était cru de n'importe qui, donc la
+        limite de débit était contournable en le forgeant.
+    [x] nginx : résolution DNS à l'exécution. Il résolvait le nom de l'API une
+        seule fois au démarrage — recréer le conteneur API donnait un 502
+        permanent jusqu'à redémarrage manuel. Vérifié : l'IP change, nginx suit.
+    [x] migrate.py détecte les colonnes manquantes, pas seulement les tables.
+        create_all ne modifie jamais une table existante : sans ce contrôle,
+        l'application démarre et échoue au premier écrit, en pleine transaction.
+    [x] Bruit de log réduit (avertissement Vault une fois par processus) —
+        dans un système de paiement, le bruit est ce qui masque une vraie alerte.
+
+    Leçon d'exploitation notée : réinitialiser la base sans vider Redis laisse
+    des tâches en file référençant des identifiants réattribués — elles agissent
+    alors sur les mauvaises lignes. `make sim-reset` fait les deux ensemble.
+    En production : ne jamais restaurer une base sans purger la file.
+
+[x] Makefile : make test-concurrency / test-chaos / test-testnet / test-robustness
+
+============================================================================
+Phase 6 : Le stack de PRODUCTION réellement démarré  [17/08/2026]
+============================================================================
+Jusqu'ici, tout ce qui était validé était le stack de simulation. Le compose de
+production n'avait jamais été lancé une seule fois. Il l'a été. Cinq défauts,
+dont un qui aurait fait échouer 100 % des paiements.
+
+[x] BLOQUANT — backend-net était `internal: true` et le worker n'était QUE sur
+    ce réseau. Aucune route vers l'API RPC ni vers l'acquéreur. Chaque paiement
+    aurait été encaissé, le transfert aurait échoué, et le reversal aussi :
+    tous les porteurs débités sans remboursement automatique.
+    Corrigé : egress-net pour worker et beat. Les bases restent isolées —
+    vérifié, postgres et redis n'ont aucune route sortante.
+
+[x] BLOQUANT — les réseaux étaient partagés avec la simulation (nom dérivé du
+    répertoire). Podman adopte un réseau existant SANS réconcilier ses options,
+    donc `internal: true` était silencieusement inactif et les bases avaient
+    Internet. Un contrôle de sécurité déclaré mais faux est pire qu'absent.
+    Corrigé : noms explicites par stack (gateway-prod-*, gateway-sim-*).
+
+[x] BLOQUANT — la passerelle acceptait des paiements alors qu'elle ne pouvait
+    pas signer. Vault ne se descelle pas tout seul : après chaque redémarrage,
+    chaque client aurait été débité puis remboursé. Corrigé : contrôle can_sign()
+    avant tout débit, remonté aussi dans /health/ready. Vérifié dans les deux
+    sens — scellé → 503 « aucun fonds débité », descellé → reprise automatique.
+
+[x] Vault ne démarrait pas du tout en rootless (mlock). Rendu explicite via
+    VAULT_DISABLE_MLOCK, avec le compromis documenté (mémoire potentiellement
+    swappée) et un avertissement preflight si le swap est actif.
+
+[x] DATABASE_SSL=true signifiait vérification complète en asyncpg, ce que le
+    certificat auto-signé du Postgres embarqué ne peut pas satisfaire.
+    Remplacé par DATABASE_SSL_MODE (disable / require / verify-full).
+
+[x] Ports 80/443 impossibles à ouvrir en rootless. Rendus configurables
+    (HTTP_PORT / HTTPS_PORT) et détectés par le preflight.
+
+Validé pour la première fois, en vrai :
+    Postgres avec SSL activé (ssl = on) · Vault en mode production (init,
+    descellement, KV v2) · la passerelle lisant la clé chaude depuis Vault
+    sans WEB3_PRIVATE_KEY dans l'environnement · isolation réseau effective ·
+    sortie du worker vers un RPC public · nginx en TLS sur le stack prod.
+
+============================================================================
+Phase 7 : Répétition contre des plateformes réelles  [17/08/2026]
+============================================================================
+Deux côtés, deux réponses très différentes.
+
+CÔTÉ CRYPTO — faisable, harnais prêt
+[x] Lien TLS acquéreur enfin testable. Iso8583Server n'avait AUCUN support
+    TLS (le client en avait) : BANK_USE_TLS=true, exigé en production, n'avait
+    donc jamais pu être exercé. Ajouté côté serveur, activé dans le simulateur,
+    vérifié de bout en bout — 0200 chiffré, 0210 avec DE39=00 et code d'autorisation.
+[x] podman-compose.prodtest.yml — overlay ajoutant l'acquéreur simulé EN TLS
+    au compose de production, qui reste inchangé.
+[x] scripts/prodtest.sh — répétition complète : compose de production réel,
+    image de production, Gunicorn, Nginx TLS, segmentation réseau, Vault en
+    mode production (init + descellement + stockage de la clé), Postgres SSL,
+    migration, puis un vrai paiement réglé sur une vraie chaîne publique.
+[x] make testnet-wallet / make prodtest / make prodtest-down
+
+    Bloqué sur une seule chose : le portefeuille doit être financé. Tous les
+    robinets Sepolia exigent un humain (captcha, compte, ou preuve de travail
+    dans le navigateur) ; les automatiser serait un abus du service.
+    Adresse générée : voir testnet-wallet.json (hors git, 0600).
+
+CÔTÉ BANCAIRE — impossible sans relation commerciale
+[ ] Il n'existe aucun hôte ISO 8583 de test public. Les environnements de
+    certification (Mastercard MTF, Visa VTS, hôtes de test des acquéreurs)
+    sont derrière un contrat ou une adhésion au réseau. Aucune quantité de
+    code ne referme cet écart.
+    Ce qui reste donc non validé : les quatre champs choisis par défaut —
+    DE22, le sous-élément DE48 du CVV2, la disposition de DE90, le format
+    de DE37. Ce sont des hypothèses jusqu'à la certification.
+
+============================================================================
+Phase 8 : Validation croisée contre une implémentation tierce  [17/08/2026]
+============================================================================
+Jusqu'ici mes messages ISO 8583 n'étaient validés que par mon propre
+simulateur — j'avais écrit les deux côtés de la conversation. Croisé avec
+iso8583sim (implémentation indépendante, MIT, PyPI).
+
+Résultat : mes messages sont corrects. Bitmap conforme, champs de données
+exactement ceux attendus, aller-retour libfin parfait. Le parseur tiers a ses
+propres bugs (mélange bytes/str dans son code).
+
+Mais l'exercice a révélé deux choix de dialecte que j'avais faits sans le
+savoir, en héritant simplement des défauts de la bibliothèque :
+
+[x] Format du bitmap — binaire (16 octets) ou hexadécimal (32 caractères).
+    Les deux sont valides ; celui qu'attend l'acquéreur fait partie de son
+    dialecte. Le mauvais choix = tous les messages rejetés comme illisibles.
+    Exposé en ACQUIRER_HEX_BITMAP, honoré partout, testé dans les deux sens.
+[x] Encodage des caractères — latin_1 ou cp500 (EBCDIC, encore courant chez
+    les acquéreurs adossés à un mainframe). Exposé en ACQUIRER_ENCODING.
+[x] Constat noté : libfin émet toujours un bitmap secondaire de 64 zéros même
+    sans champ 65-128. Valide, mais certains hôtes le refusent — à confirmer
+    lors de la certification.
+
+Ce que la validation croisée NE donne pas : la conformité au dialecte d'un
+acquéreur précis. Elle réduit le risque de format, elle ne remplace pas la
+certification.
+
+============================================================================
+Phase 9 : PAIEMENT COMPLET SUR CHAÎNE PUBLIQUE  [17/08/2026]
+============================================================================
+Le stack de production a porté un paiement de la carte à la chaîne, réglé et
+confirmé sur Sepolia.
+
+    Bloc            11509864 (Sepolia)
+    Transaction     0x3b7334f3a05b93c0cd942c86023dbf64035175e77e0a14e917952452699ecc7f
+    Montant         1,00 fiat → 1000000 unités (6 décimales) = 1,00 jeton
+    Durée totale    44 secondes, autorisation comprise
+
+Chaîne des événements, toutes vérifiées indépendamment :
+    0200 sur lien TLS VÉRIFIÉ  →  0210 approuvé, 100 unités mineures
+    clé chaude lue depuis Vault (aucune clé dans l'environnement)
+    solde vérifié sur la vraie chaîne
+    diffusion nonce=1, puis 2 confirmations réelles
+    reçu on-chain : statut SUCCÈS, destinataire et montant conformes
+
+Tout est de production sauf l'acquéreur : compose de production, image de
+production, Gunicorn, Nginx TLS, segmentation réseau, Vault en mode production
+avec init et descellement réels, Postgres SSL, migration explicite.
+
+[x] Le TLS acquéreur est VÉRIFIÉ, pas contourné. Mon garde-fou refusait
+    BANK_TLS_INSECURE en production — plutôt que de l'affaiblir, un certificat
+    CN=bank-simulator est émis et réellement validé par la passerelle.
+[x] ALLOW_SIMULATED_ACQUIRER — échappatoire étroite pour les répétitions :
+    n'excuse QUE le contrôle du host acquéreur, journalise en CRITICAL, et le
+    preflight la REFUSE catégoriquement. Elle ne peut pas atteindre un système
+    servant de vrais porteurs.
+[x] --deploy-token : déploie un ERC-20 sur la vraie chaîne avec le gas
+    disponible, quand le robinet du jeton exige une authentification.
+[x] --local-chain : même répétition sans aucun robinet.
+
+Défauts trouvés pendant ces exécutions :
+[x] Vault déjà initialisé → message explicite au lieu d'un échec générique
+[x] Deux exécutions concurrentes → verrou de processus (résistant aux PID
+    réutilisés après une interruption)
+[x] env_file codé en dur dans le compose de production → paramétrable via
+    GATEWAY_ENV_FILE (compose fusionne les listes env_file au lieu de les
+    remplacer, un overlay ne suffisait pas)
+[x] Clé du certificat en 0600 illisible par l'utilisateur du conteneur
+
+Ce qui reste non validé, et ne peut pas l'être ici : le dialecte d'un
+acquéreur réel. DE22, sous-élément DE48 du CVV2, disposition DE90, format
+DE37, format du bitmap. Certification obligatoire.
+
+============================================================================
 Reste à faire — non-code, côté humain
 ============================================================================
 [ ] URGENT : nginx/ssl/server.key est versionné dans git. Le retirer :

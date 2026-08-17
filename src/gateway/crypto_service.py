@@ -76,8 +76,16 @@ return 0
 """
 
 
+#: Guards a once-per-process warning; see _fetch_key_from_vault.
+_vault_warning_logged = False
+
+
 class InsufficientFunds(RuntimeError):
     """The hot wallet cannot cover the transfer. Never retry blindly."""
+
+
+class GasPriceTooHigh(RuntimeError):
+    """Fees are above the configured ceiling. Temporary — wait, then refund."""
 
 
 class CryptoService:
@@ -109,9 +117,17 @@ class CryptoService:
 
     # ── RPC plumbing ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_provider(url: str) -> Web3:
-        return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 30}))
+    #: Real calls get room to breathe; a liveness probe must not.
+    RPC_CALL_TIMEOUT = 30
+    RPC_PROBE_TIMEOUT = 3
+
+    @classmethod
+    def _build_provider(cls, url: str, timeout: Optional[int] = None) -> Web3:
+        return Web3(
+            Web3.HTTPProvider(
+                url, request_kwargs={"timeout": timeout or cls.RPC_CALL_TIMEOUT}
+            )
+        )
 
     @property
     def active_rpc(self) -> str:
@@ -121,9 +137,15 @@ class CryptoService:
         """Point ``self.w3`` at the first responsive provider. Rotates on failure."""
         for offset in range(len(self.rpc_urls)):
             index = (self._rpc_index + offset) % len(self.rpc_urls)
-            candidate = self._build_provider(self.rpc_urls[index])
+            # Probe with a short timeout, then keep the full-timeout provider
+            # for real work. Probing at the call timeout meant that with an
+            # unreachable node, each retry burned 30s before even starting —
+            # so a customer waited minutes for a refund the system had already
+            # decided to make.
+            probe = self._build_provider(self.rpc_urls[index], self.RPC_PROBE_TIMEOUT)
             try:
-                if candidate.is_connected():
+                if probe.is_connected():
+                    candidate = self._build_provider(self.rpc_urls[index])
                     if index != self._rpc_index or self.w3 is None:
                         LOGGER.info(f"Using Web3 RPC: {self.rpc_urls[index]}")
                     self._rpc_index = index
@@ -150,8 +172,10 @@ class CryptoService:
         return self._select_working_rpc()
 
     def is_connected(self) -> bool:
+        """Liveness of the active provider, answered quickly."""
         try:
-            return self.w3.is_connected()
+            probe = self._build_provider(self.active_rpc, self.RPC_PROBE_TIMEOUT)
+            return probe.is_connected()
         except Exception:
             return False
 
@@ -185,7 +209,16 @@ class CryptoService:
             )
             return secret["data"]["data"].get("private_key")
         except Exception as exc:
-            LOGGER.warning(f"Could not read the Web3 key from Vault: {exc}")
+            # Once per process. A CryptoService is built per Celery task, so
+            # warning every time buries the lines that actually matter — and in
+            # a payment system, log noise is how a real alert gets missed.
+            global _vault_warning_logged
+            if not _vault_warning_logged:
+                _vault_warning_logged = True
+                LOGGER.warning(
+                    f"Could not read the Web3 key from Vault ({exc}); "
+                    "falling back to the environment. Logged once per process."
+                )
             return None
 
     # ── Distributed nonce allocation ────────────────────────────────────────
@@ -289,19 +322,50 @@ class CryptoService:
         units = (Decimal(str(amount_fiat)) / rate) * (Decimal(10) ** decimals)
         return int(units.to_integral_value(rounding=ROUND_DOWN))
 
-    def _fee_parameters(self) -> dict:
-        """EIP-1559 fees, falling back to legacy gas price on chains without them."""
+    def _fee_parameters(self, multiplier: Optional[Decimal] = None) -> dict:
+        """EIP-1559 fees, falling back to legacy gas price on chains without them.
+
+        Refuses to build fees above ``WEB3_MAX_FEE_GWEI``. A gas spike is not a
+        reason to spend more on delivering a transfer than the transfer is
+        worth; the caller retries later, and refunds the customer if the
+        network never calms down.
+        """
+        ceiling_wei = int(Decimal(self.w3.to_wei(1, "gwei")) * settings.web3_max_fee_gwei)
+        bump = Decimal(multiplier) if multiplier else Decimal(1)
+
         latest = self.w3.eth.get_block("latest")
         base_fee = latest.get("baseFeePerGas")
+
         if base_fee is None:
-            return {"gasPrice": self.w3.eth.gas_price}
+            gas_price = int(Decimal(self.w3.eth.gas_price) * bump)
+            if gas_price > ceiling_wei:
+                raise GasPriceTooHigh(
+                    f"Gas price {gas_price / 1e9:.1f} gwei exceeds the "
+                    f"{settings.web3_max_fee_gwei} gwei ceiling."
+                )
+            return {"gasPrice": gas_price}
+
         priority = self.w3.to_wei(2, "gwei")
         try:
             priority = max(priority, self.w3.eth.max_priority_fee)
         except Exception:
             pass
+
         # 2x headroom covers a few blocks of base-fee growth.
-        return {"maxFeePerGas": base_fee * 2 + priority, "maxPriorityFeePerGas": priority}
+        max_fee = int((Decimal(base_fee * 2 + priority)) * bump)
+        priority = int(Decimal(priority) * bump)
+
+        if max_fee > ceiling_wei:
+            raise GasPriceTooHigh(
+                f"maxFeePerGas would be {max_fee / 1e9:.1f} gwei, above the "
+                f"{settings.web3_max_fee_gwei} gwei ceiling (base fee "
+                f"{base_fee / 1e9:.1f}). Waiting for the fee market to settle."
+            )
+
+        return {
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": min(priority, max_fee),
+        }
 
     @staticmethod
     def _raw_bytes(signed_tx) -> bytes:
@@ -321,11 +385,14 @@ class CryptoService:
         to_address: str,
         amount_fiat: Decimal,
         exchange_rate: Optional[Decimal] = None,
-    ) -> Tuple[str, int]:
-        """Sign and broadcast a transfer. Returns ``(tx_hash, token_units)``.
+    ) -> Tuple[str, int, int]:
+        """Sign and broadcast a transfer. Returns ``(tx_hash, token_units, nonce)``.
 
         Returns as soon as the transaction is accepted by the node so the caller
-        can persist the hash before waiting for confirmations.
+        can persist the hash before waiting for confirmations. The nonce comes
+        back too: replacing a transfer stuck in the mempool means rebroadcasting
+        at the *same* nonce with higher fees, and that number is not otherwise
+        recoverable once the process that chose it is gone.
         """
         if not self.account:
             raise ValueError("Crypto service has no private key configured.")
@@ -375,7 +442,54 @@ class CryptoService:
         LOGGER.info(
             f"ERC-20 transfer broadcast: hash={tx_hash_hex} nonce={nonce} units={token_units}"
         )
-        return tx_hash_hex, token_units
+        return tx_hash_hex, token_units, nonce
+
+    async def replace_stuck_transfer(
+        self,
+        token_address: str,
+        to_address: str,
+        token_units: int,
+        nonce: int,
+    ) -> str:
+        """Rebroadcast at the same nonce with higher fees.
+
+        A transfer priced below the market sits in the mempool indefinitely: it
+        is neither delivered nor refundable, because the reversal guard sees it
+        as still pending. The only way out is to replace it — same nonce, fees
+        raised by at least ~10% or the network rejects the replacement.
+
+        Returns the new hash. The old one becomes permanently unmineable, so
+        exactly one of the two can ever land.
+        """
+        if not self.account:
+            raise ValueError("Crypto service has no private key configured.")
+
+        self.ensure_connected()
+        self.verify_chain()
+
+        token_address = self.w3.to_checksum_address(token_address)
+        to_address = self.w3.to_checksum_address(to_address)
+        contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+
+        # No nonce lock here: the nonce is already fixed by the transaction
+        # being replaced, so there is nothing to allocate and nothing to race.
+        tx_params = {
+            "nonce": nonce,
+            "from": self.account.address,
+            "chainId": self.w3.eth.chain_id,
+            **self._fee_parameters(multiplier=settings.web3_replacement_multiplier),
+        }
+        call = contract.functions.transfer(to_address, token_units)
+        tx = await asyncio.to_thread(call.build_transaction, tx_params)
+        tx["gas"] = int(tx.get("gas", 100_000) * 1.2)
+
+        signed_tx = self.w3.eth.account.sign_transaction(tx, self.private_key)
+        tx_hash = await asyncio.to_thread(
+            self.w3.eth.send_raw_transaction, self._raw_bytes(signed_tx)
+        )
+        tx_hash_hex = self.w3.to_hex(tx_hash)
+        LOGGER.warning(f"Replaced a stuck transfer at nonce {nonce}: new hash {tx_hash_hex}")
+        return tx_hash_hex
 
     async def await_confirmation(self, tx_hash: str, confirmations: Optional[int] = None):
         """Wait for the receipt, then for N further blocks. Bounded on both ends."""
@@ -421,7 +535,7 @@ class CryptoService:
         exchange_rate: Optional[Decimal] = None,
     ) -> str:
         """Broadcast and confirm in one call. Convenience wrapper for scripts."""
-        tx_hash, _ = await self.broadcast_erc20_transfer(
+        tx_hash, _, _ = await self.broadcast_erc20_transfer(
             token_address, to_address, amount_fiat, exchange_rate
         )
         await self.await_confirmation(tx_hash)

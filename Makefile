@@ -300,6 +300,56 @@ sim-decline: ## Tester le refus bancaire (aucun crypto ne doit partir)
 sim-reconcile: ## Lancer la réconciliation à blanc dans la simulation
 	$(SIM_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
 
+.PHONY: sim-reset
+sim-reset: ## Repartir de zéro (supprime base ET file d'attente)
+	@echo "  ⚠  Réinitialise base et Redis. Les deux ensemble : une file"
+	@echo "     survivante référencerait des identifiants réattribués."
+	$(SIM_COMPOSE) down
+	-podman volume rm libfin_pgdata_sim libfin_redisdata_sim
+	$(SIM_COMPOSE) up -d
+
+# ──────────────────────────────────────────────────────────────
+#  Vérifications de robustesse
+# ──────────────────────────────────────────────────────────────
+#  Trois angles que les tests unitaires ne couvrent pas :
+#  la contention, les pannes, et le comportement sur une vraie chaîne.
+# ──────────────────────────────────────────────────────────────
+.PHONY: test-concurrency
+test-concurrency: ## Paiements simultanés : collision de nonce ou de STAN ?
+	podman run --rm --network libfin_backend-net -v ./tests/load:/t:ro,z \
+		--entrypoint python3 gateway:sim /t/concurrency_test.py \
+		--count $(or $(COUNT),60) --amount 1.00 \
+		--base-url http://gateway-api:8000 --settle-timeout 400
+
+.PHONY: test-chaos
+test-chaos: ## Injection de pannes : l'argent du client est-il toujours protégé ?
+	python3 tests/load/chaos_test.py $(if $(ONLY),--only $(ONLY),)
+
+.PHONY: test-chaos-list
+test-chaos-list: ## Lister les scénarios de panne
+	python3 tests/load/chaos_test.py --list
+
+.PHONY: test-testnet
+test-testnet: ## Valider le service crypto contre une vraie chaîne publique
+	python3 tests/load/testnet_check.py
+
+.PHONY: testnet-wallet
+testnet-wallet: ## Générer un portefeuille de testnet (à financer par un robinet)
+	./scripts/gen_testnet_wallet.py
+
+.PHONY: prodtest
+prodtest: ## Répéter la production contre une vraie chaîne (nécessite un portefeuille financé)
+	./scripts/prodtest.sh
+
+.PHONY: prodtest-down
+prodtest-down: ## Démonter la répétition de production
+	./scripts/prodtest.sh --down
+
+.PHONY: test-robustness
+test-robustness: test-concurrency test-chaos test-testnet ## Les trois d'affilée
+	@echo ""
+	@echo "  ✔ Contention, pannes et chaîne réelle : tous validés"
+
 # ──────────────────────────────────────────────────────────────
 #  PRODUCTION
 # ──────────────────────────────────────────────────────────────

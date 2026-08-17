@@ -1,0 +1,62 @@
+# ============================================================================
+#  Overlay: a local chain for the production rehearsal.
+# ============================================================================
+#  Stacked on top of podman-compose.prod.yml and podman-compose.prodtest.yml
+#  when a public testnet is out of reach — every Sepolia faucet requires a
+#  human, so waiting on one blocks the only thing that has never been shown:
+#  the production stack completing a payment from card to chain.
+#
+#  What stays real: the production compose, the production image, Gunicorn,
+#  Nginx with TLS, the network segmentation, Vault in production mode with a
+#  real init and unseal, Postgres with SSL, the explicit migration step, and
+#  the acquirer link over TLS.
+#
+#  What is traded away: a real fee market, real block times, real reorgs and a
+#  real RPC provider. Those are covered separately by tests/load/testnet_check.py,
+#  which runs against public Sepolia.
+# ============================================================================
+
+services:
+  gateway-anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: gateway-anvil-prodtest
+    restart: unless-stopped
+    entrypoint: ["anvil"]
+    command:
+      - "--host=0.0.0.0"
+      - "--chain-id=31337"
+      - "--block-time=1"
+      - "--state=/state/anvil.json"
+      - "--state-interval=5"
+      - "--silent"
+    user: root
+    volumes:
+      - anvildata_prodtest:/state
+    networks:
+      # The worker signs from egress-net; the API is on frontend-net.
+      - egress-net
+      - frontend-net
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  gateway-token-deployer:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: gateway-token-deployer-prodtest
+    entrypoint: ["/bin/sh", "/sim/deploy_token.sh"]
+    environment:
+      RPC_URL: http://gateway-anvil:8545
+      GATEWAY_WALLET: "${LOCAL_CHAIN_WALLET:-0x70997970C51812dc3A010C7d01b50e0d17dc79C8}"
+    volumes:
+      - ./sim:/sim:ro,z
+    depends_on:
+      gateway-anvil:
+        condition: service_healthy
+    networks:
+      - egress-net
+    restart: "no"
+
+volumes:
+  anvildata_prodtest:

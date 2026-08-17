@@ -19,9 +19,31 @@
 # ============================================================================
 
 networks:
+  # Nginx and the API. Not internal, so the API can reach the acquirer.
+  #
+  # Every network is named explicitly. Compose derives a default name from the
+  # project directory, which made production reuse the networks the simulation
+  # stack had already created — and podman adopts an existing network as-is
+  # rather than reconciling its options, so `internal: true` below was silently
+  # inert and the datastores had a route to the internet. A declared security
+  # control that is quietly false is worse than none.
   frontend-net:
+    name: gateway-prod-frontend
+
+  # Datastores. `internal` means no route off the host: Postgres, Redis and
+  # Vault cannot be reached from outside and — more to the point — cannot
+  # reach out. Card data and the hot wallet key have nowhere to go.
   backend-net:
-    internal: true          # no route to the internet from the data plane
+    name: gateway-prod-backend
+    internal: true
+
+  # Outbound path for the worker and the beat scheduler. They need the RPC
+  # provider and the acquirer, and putting them on the internal network alone
+  # left them with no route to either: every transfer would have failed and
+  # every reversal with it, so every cardholder would have been charged with
+  # no automatic refund. The datastores stay off this network.
+  egress-net:
+    name: gateway-prod-egress
 
 volumes:
   pgdata_prod:
@@ -110,11 +132,21 @@ services:
       - IPC_LOCK
     environment:
       VAULT_ADDR: http://127.0.0.1:8200
+      # disable_mlock is a deliberate trade-off, not an oversight. With mlock
+      # enabled Vault refuses to start unless it can lock memory, which a
+      # rootless container cannot do — it exits with "Failed to lock memory"
+      # and the gateway is left with no hot wallet key at all.
+      #
+      # Disabling it means Vault's memory may be swapped to disk. That is only
+      # acceptable if the host has swap disabled or encrypted. Verify with
+      # `swapon --show` (empty is what you want) before going live, or run the
+      # stack rootful and set this back to false.
+      VAULT_DISABLE_MLOCK: ${VAULT_DISABLE_MLOCK:-true}
       VAULT_LOCAL_CONFIG: >-
         {"storage": {"file": {"path": "/vault/file"}},
          "listener": [{"tcp": {"address": "0.0.0.0:8200", "tls_disable": 1}}],
          "default_lease_ttl": "168h", "max_lease_ttl": "720h",
-         "disable_mlock": false, "ui": false}
+         "disable_mlock": ${VAULT_DISABLE_MLOCK:-true}, "ui": false}
     command: ["server"]
     volumes:
       - vaultdata_prod:/vault/file
@@ -143,7 +175,10 @@ services:
     container_name: gateway-api-prod
     restart: always
     env_file:
-      - .env.prod
+      # Overridable so a rehearsal can point at its own file. Compose merges
+      # env_file lists rather than replacing them, so an overlay cannot swap
+      # this out — it has to be a variable. Production leaves it alone.
+      - ${GATEWAY_ENV_FILE:-.env.prod}
     depends_on:
       gateway-postgres:
         condition: service_healthy
@@ -179,13 +214,19 @@ services:
     container_name: gateway-worker-prod
     restart: always
     env_file:
-      - .env.prod
+      # Overridable so a rehearsal can point at its own file. Compose merges
+      # env_file lists rather than replacing them, so an overlay cannot swap
+      # this out — it has to be a variable. Production leaves it alone.
+      - ${GATEWAY_ENV_FILE:-.env.prod}
     depends_on:
       gateway-redis:
         condition: service_healthy
       gateway-postgres:
         condition: service_healthy
     networks:
+      # egress-net for the RPC provider and the acquirer; backend-net for the
+      # database and the broker.
+      - egress-net
       - backend-net
     command:
       - celery
@@ -198,7 +239,10 @@ services:
     # between "broadcast" and "recorded". Let the task finish.
     stop_grace_period: 120s
     healthcheck:
-      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$HOSTNAME"]
+      # $HOSTNAME is unset in the container's non-interactive shell, so the
+      # old `-d celery@$$HOSTNAME` asked for a node named "celery@" and every
+      # worker reported unhealthy. `hostname` is what Celery actually uses.
+      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$(hostname) | grep -q pong"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -212,11 +256,17 @@ services:
     container_name: gateway-beat-prod
     restart: always
     env_file:
-      - .env.prod
+      # Overridable so a rehearsal can point at its own file. Compose merges
+      # env_file lists rather than replacing them, so an overlay cannot swap
+      # this out — it has to be a variable. Production leaves it alone.
+      - ${GATEWAY_ENV_FILE:-.env.prod}
     depends_on:
       gateway-redis:
         condition: service_healthy
     networks:
+      # Reconciliation checks transactions against the chain, so beat needs
+      # the same outbound path as the worker.
+      - egress-net
       - backend-net
     command:
       - celery
@@ -235,12 +285,29 @@ services:
     image: docker.io/library/nginx:1.27-alpine
     container_name: gateway-nginx-prod
     restart: always
+    # Rootless podman cannot bind below 1024: the container fails to start with
+    # "cannot expose privileged port 80". Either raise the host's
+    # net.ipv4.ip_unprivileged_port_start, run the stack rootful, or publish
+    # high ports here and put the host's own proxy or a firewall redirect in
+    # front. Defaults stay at the standard ports for a rootful deployment.
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
       - ./nginx/ssl:/etc/nginx/ssl:ro,z
+    # Substitute the container DNS server into the config, then start. The
+    # nameserver address is assigned by the container runtime and is not known
+    # until the container exists, so it cannot be baked into nginx.conf.
+    command:
+      - sh
+      - -c
+      - |
+        RESOLVER=$$(awk '/^nameserver/ {print $$2; exit}' /etc/resolv.conf)
+        RESOLVER=$${RESOLVER:-127.0.0.11}
+        echo "nginx: resolving upstreams through $${RESOLVER}"
+        sed "s/__RESOLVER__/$${RESOLVER}/" /etc/nginx/nginx.conf > /tmp/nginx.conf
+        exec nginx -c /tmp/nginx.conf -g 'daemon off;'
     depends_on:
       gateway-api:
         condition: service_healthy

@@ -64,6 +64,12 @@ class Transaction(Base):
     crypto_tx_hash = Column(String(66), nullable=True)
     #: Token amount actually sent, in the ERC-20's smallest unit.
     crypto_amount_units = Column(Numeric(precision=38, scale=0), nullable=True)
+    #: Nonce the transfer was signed with. Replacing a transaction stuck in the
+    #: mempool requires rebroadcasting at the same nonce, and the process that
+    #: chose it is usually long gone by then.
+    crypto_nonce = Column(Integer, nullable=True)
+    #: How many times this transfer has been re-priced and rebroadcast.
+    crypto_replacements = Column(Integer, nullable=False, default=0)
 
     reversal_stan = Column(String(6), nullable=True)
     reversal_attempts = Column(Integer, nullable=False, default=0)

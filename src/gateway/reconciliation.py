@@ -73,7 +73,14 @@ async def reconcile(act: bool = True) -> List[str]:
                         counters["reversed"] += 1
 
         # ── Fiat captured but nothing delivered: requeue ─────────────────────
-        cutoff = utcnow() - timedelta(minutes=settings.stale_transaction_minutes)
+        # Never call a transaction stale while a worker could still be working
+        # on it, or every slow confirmation gets a redundant duplicate task.
+        # The floor is the longest a single attempt can legitimately take.
+        longest_attempt = (
+            settings.web3_receipt_timeout_sec + settings.web3_confirmation_timeout_sec + 120
+        )
+        stale_seconds = max(settings.stale_transaction_minutes * 60, longest_attempt)
+        cutoff = utcnow() - timedelta(seconds=stale_seconds)
         async with async_session() as session:
             stale = (
                 await session.execute(

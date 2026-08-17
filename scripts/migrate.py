@@ -34,30 +34,62 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [migrate] %(levelnam
 LOGGER = logging.getLogger("migrate")
 
 
-async def _existing_tables() -> set:
+async def _inspect_schema() -> dict:
+    """Existing tables mapped to their column names."""
+
+    def collect(sync_conn):
+        inspector = inspect(sync_conn)
+        return {
+            table: {column["name"] for column in inspector.get_columns(table)}
+            for table in inspector.get_table_names()
+        }
+
     async with engine.begin() as conn:
-        return set(await conn.run_sync(lambda sync_conn: inspect(sync_conn).get_table_names()))
+        return await conn.run_sync(collect)
 
 
 async def migrate(check_only: bool) -> int:
-    expected = set(Base.metadata.tables)
-    existing = await _existing_tables()
-    missing = expected - existing
+    existing = await _inspect_schema()
+    expected_tables = set(Base.metadata.tables)
+    missing_tables = expected_tables - set(existing)
 
-    LOGGER.info(f"Expected tables: {sorted(expected)}")
+    # Columns added to a model after a table already exists are invisible to
+    # create_all — it creates tables, it never alters them. Without this check
+    # the application starts happily and fails at the first write, which for
+    # this system means mid-payment.
+    missing_columns = {}
+    for name, table in Base.metadata.tables.items():
+        if name in existing:
+            absent = {c.name for c in table.columns} - existing[name]
+            if absent:
+                missing_columns[name] = sorted(absent)
+
+    LOGGER.info(f"Expected tables: {sorted(expected_tables)}")
     LOGGER.info(f"Existing tables: {sorted(existing)}")
 
-    if not missing:
+    if not missing_tables and not missing_columns:
         LOGGER.info("The schema is up to date.")
         await engine.dispose()
         return 0
 
-    if check_only:
-        LOGGER.error(f"Missing tables: {sorted(missing)}")
+    if missing_columns:
+        for table, columns in missing_columns.items():
+            LOGGER.error(f"Table '{table}' is missing column(s): {', '.join(columns)}")
+        LOGGER.error(
+            "Adding columns is beyond this script: it creates tables and never alters "
+            "them, so it cannot do this without risking the data already there. Use "
+            "Alembic, or in a disposable environment recreate the database "
+            "(`make sim-down` drops the simulation volumes)."
+        )
         await engine.dispose()
         return 1
 
-    LOGGER.info(f"Creating: {sorted(missing)}")
+    if check_only:
+        LOGGER.error(f"Missing tables: {sorted(missing_tables)}")
+        await engine.dispose()
+        return 1
+
+    LOGGER.info(f"Creating: {sorted(missing_tables)}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     LOGGER.info("Schema applied.")

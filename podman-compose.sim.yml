@@ -24,8 +24,12 @@
 # ============================================================================
 
 networks:
+  # Named explicitly so the simulation can never pre-create — and thereby
+  # weaken — a network the production stack expects to own.
   frontend-net:
+    name: gateway-sim-frontend
   backend-net:
+    name: gateway-sim-backend
 
 volumes:
   pgdata_sim:
@@ -214,7 +218,10 @@ services:
       - --loglevel=info
       - --concurrency=4
     healthcheck:
-      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$HOSTNAME"]
+      # $HOSTNAME is unset in the container's non-interactive shell, so the
+      # old `-d celery@$$HOSTNAME` asked for a node named "celery@" and every
+      # worker reported unhealthy. `hostname` is what Celery actually uses.
+      test: ["CMD-SHELL", "celery -A gateway.worker.celery_app inspect ping -d celery@$$(hostname) | grep -q pong"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -251,6 +258,18 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
       - ./nginx/ssl:/etc/nginx/ssl:ro,z
+    # Substitute the container DNS server into the config, then start. The
+    # nameserver address is assigned by the container runtime and is not known
+    # until the container exists, so it cannot be baked into nginx.conf.
+    command:
+      - sh
+      - -c
+      - |
+        RESOLVER=$$(awk '/^nameserver/ {print $$2; exit}' /etc/resolv.conf)
+        RESOLVER=$${RESOLVER:-127.0.0.11}
+        echo "nginx: resolving upstreams through $${RESOLVER}"
+        sed "s/__RESOLVER__/$${RESOLVER}/" /etc/nginx/nginx.conf > /tmp/nginx.conf
+        exec nginx -c /tmp/nginx.conf -g 'daemon off;'
     depends_on:
       - gateway-api
     networks:

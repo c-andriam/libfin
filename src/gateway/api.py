@@ -1,3 +1,5 @@
+import asyncio
+import ipaddress
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -31,19 +33,47 @@ acquirer_service = AcquirerService()
 # ---------------------------------------------------------------------------
 
 
+def _peer_is_trusted_proxy(peer: str) -> bool:
+    """Whether this peer's ``X-Forwarded-For`` may be believed.
+
+    The header is client-supplied. Believing it from an untrusted peer means
+    anyone can present a fresh identity per request and walk straight around the
+    rate limit — so the peer address is matched against the configured proxies
+    rather than merely checking that the setting is non-empty.
+    """
+    if "*" in settings.trusted_proxies:
+        return True
+    if not peer:
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+
+    for entry in settings.trusted_proxies:
+        try:
+            if "/" in entry:
+                if address in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif address == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            LOGGER.warning(f"TRUSTED_PROXIES contains an unparseable entry: {entry!r}")
+    return False
+
+
 def client_identity(request: Request) -> str:
     """Identify the caller for rate limiting.
 
     Behind Nginx every request arrives from the proxy, so keying on the socket
-    address would put the whole internet in one bucket. Trust the left-most
-    ``X-Forwarded-For`` entry only when the deployment says the proxy is
-    trusted — otherwise a client could forge its way around the limit.
+    address alone would put the whole internet in one bucket.
     """
-    if settings.trusted_proxies:
+    peer = request.client.host if request.client else ""
+    if _peer_is_trusted_proxy(peer):
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
             return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    return peer or "unknown"
 
 
 limiter = Limiter(key_func=client_identity)
@@ -216,6 +246,11 @@ async def health_ready(db: AsyncSession = Depends(get_session)):
 
     checks["acquirer"] = "ok" if acquirer_service.is_connected else "disconnected"
 
+    signable, sign_reason = await can_sign()
+    checks["signing"] = "ok" if signable else "unavailable"
+    if not signable:
+        LOGGER.error(f"Readiness: {sign_reason}")
+
     breaker = web3_circuit_breaker.health()
     checks["circuit_breaker"] = breaker["state"]
     if not breaker["reachable"]:
@@ -243,6 +278,58 @@ async def health_ready(db: AsyncSession = Depends(get_session)):
 # ---------------------------------------------------------------------------
 
 
+#: Cached answer to "can this gateway sign a transfer right now?", with the
+#: time it was taken. Checked on every payment, so it must be cheap.
+_signing_check: dict = {"ok": False, "checked_at": 0.0, "reason": "not checked yet"}
+_SIGNING_CHECK_TTL = 30.0
+
+
+async def can_sign() -> tuple:
+    """Whether the hot wallet key is currently reachable.
+
+    Without it no transfer can be made, and accepting a payment anyway means
+    charging a card the gateway cannot serve — the customer is debited, the
+    transfer fails, and the reversal machinery runs for a problem that was
+    knowable before taking the money. A sealed Vault after a restart is the
+    ordinary way this happens.
+
+    The result is cached briefly: this sits on the payment path.
+    """
+    import time
+
+    now = time.monotonic()
+    if now - _signing_check["checked_at"] < _SIGNING_CHECK_TTL:
+        return _signing_check["ok"], _signing_check["reason"]
+
+    def probe() -> tuple:
+        try:
+            from gateway.crypto_service import CryptoService
+
+            service = CryptoService()
+            if service.account is None:
+                return False, "no hot wallet key available (is Vault sealed?)"
+            return True, "ok"
+        except Exception as exc:
+            return False, f"crypto service unavailable: {exc}"
+
+    ok, reason = await asyncio.to_thread(probe)
+    _signing_check.update({"ok": ok, "checked_at": now, "reason": reason})
+    if not ok:
+        LOGGER.critical(f"Gateway cannot sign transfers: {reason}. Refusing payments.")
+    return ok, reason
+
+
+def _duplicate_response(existing: Transaction) -> "PaymentResponse":
+    return PaymentResponse(
+        status=existing.status.value,
+        message="Duplicate request. Returning the existing transaction.",
+        transaction_id=existing.id,
+        fiat_amount=existing.amount,
+        tx_hash=existing.crypto_tx_hash,
+        stan=existing.stan,
+    )
+
+
 async def _fail_transaction(tx_id: int, status: TransactionStatus, reason: str) -> None:
     async with async_session() as session:
         tx = await session.get(Transaction, tx_id)
@@ -257,16 +344,31 @@ async def _fail_transaction(tx_id: int, status: TransactionStatus, reason: str) 
 async def process_payment(
     request: Request,
     payment_req: PaymentRequest,
-    db: AsyncSession = Depends(get_session),
     idempotency_key: str = Header(None, alias="Idempotency-Key"),
 ):
     """Authorise the fiat leg synchronously, then hand the crypto leg to a worker.
 
     Returns 202 once the bank has approved: the crypto transfer is asynchronous
     and its progress is available from ``GET /transaction/{id}``.
+
+    Note the absence of a ``Depends(get_session)`` here. A dependency-injected
+    session lives for the whole request, and this request spends most of its
+    life waiting on the acquirer — up to ``BANK_TIMEOUT_SEC``. Pinning a
+    database connection across that external call exhausts the pool under load:
+    concurrent payments then queue on the pool and fail with a 500 after
+    ``pool_timeout``, which is how a busy period turns into an outage. Each
+    block below opens a session, does its work, and gives the connection back.
     """
 
     # ── Refuse before touching the card if we cannot deliver the crypto ─────
+    signable, reason = await can_sign()
+    if not signable:
+        LOGGER.error(f"Refusing the payment before any debit: {reason}")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. No funds were debited.",
+        )
+
     if not await web3_circuit_breaker.can_execute_async():
         LOGGER.warning("Circuit breaker is open; refusing the payment before any debit.")
         raise HTTPException(
@@ -276,21 +378,17 @@ async def process_payment(
 
     # ── Idempotency ─────────────────────────────────────────────────────────
     if idempotency_key:
-        existing = (
-            await db.execute(
-                select(Transaction).where(Transaction.idempotency_key == idempotency_key)
-            )
-        ).scalar_one_or_none()
-        if existing:
-            LOGGER.info(f"Idempotency hit for key={idempotency_key} (transaction {existing.id}).")
-            return PaymentResponse(
-                status=existing.status.value,
-                message="Duplicate request. Returning the existing transaction.",
-                transaction_id=existing.id,
-                fiat_amount=existing.amount,
-                tx_hash=existing.crypto_tx_hash,
-                stan=existing.stan,
-            )
+        async with async_session() as session:
+            existing = (
+                await session.execute(
+                    select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                LOGGER.info(
+                    f"Idempotency hit for key={idempotency_key} (transaction {existing.id})."
+                )
+                return _duplicate_response(existing)
 
     if not luhn_checksum(payment_req.pan):
         LOGGER.warning("Rejected a card number that fails the Luhn check.")
@@ -303,38 +401,33 @@ async def process_payment(
     )
 
     # ── Persist before authorising, so nothing is debited off the books ─────
-    transaction = Transaction(
-        amount=payment_req.amount,
-        currency=settings.acquirer_currency,
-        masked_pan=masked,
-        target_wallet=payment_req.target_wallet,
-        idempotency_key=idempotency_key,
-        status=TransactionStatus.PENDING,
-    )
-    db.add(transaction)
-    try:
-        await db.commit()
-    except IntegrityError:
-        # Two identical requests raced past the lookup above; the unique index
-        # on the idempotency key is what actually prevents the double charge.
-        await db.rollback()
-        existing = (
-            await db.execute(
-                select(Transaction).where(Transaction.idempotency_key == idempotency_key)
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            raise HTTPException(status_code=409, detail="Conflicting request.")
-        return PaymentResponse(
-            status=existing.status.value,
-            message="Duplicate request. Returning the existing transaction.",
-            transaction_id=existing.id,
-            fiat_amount=existing.amount,
-            tx_hash=existing.crypto_tx_hash,
-            stan=existing.stan,
+    async with async_session() as session:
+        transaction = Transaction(
+            amount=payment_req.amount,
+            currency=settings.acquirer_currency,
+            masked_pan=masked,
+            target_wallet=payment_req.target_wallet,
+            idempotency_key=idempotency_key,
+            status=TransactionStatus.PENDING,
         )
-    await db.refresh(transaction)
-    tx_id = transaction.id
+        session.add(transaction)
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Two identical requests raced past the lookup above; the unique
+            # index on the idempotency key is what actually prevents the
+            # double charge.
+            await session.rollback()
+            existing = (
+                await session.execute(
+                    select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise HTTPException(status_code=409, detail="Conflicting request.")
+            return _duplicate_response(existing)
+        await session.refresh(transaction)
+        tx_id = transaction.id
 
     # The worker needs the real PAN to reverse the payment if the crypto leg
     # fails, but it must not travel through the broker. Store it encrypted.
