@@ -313,6 +313,33 @@ test-chaos-list: ## Lister les scénarios de panne
 test-testnet: ## Valider le service crypto contre une vraie chaîne publique
 	python3 tests/load/testnet_check.py
 
+# ──────────────────────────────────────────────────────────────
+#  Démonstration
+# ──────────────────────────────────────────────────────────────
+.PHONY: demo
+demo: ## Démonstration : un paiement carte → crypto, vérifié de bout en bout
+	./scripts/demo.sh $(or $(CURRENCY),USD) $(or $(AMOUNT),300.00)
+
+.PHONY: demo-multi
+demo-multi: ## Démonstration multi-devises : USD, EUR et GBP
+	./scripts/demo.sh --multi $(or $(AMOUNT),300.00)
+
+.PHONY: demo-failure
+demo-failure: ## Démonstration : la livraison échoue, le client n'est pas débité
+	./scripts/demo.sh --failure
+
+.PHONY: verify-wallet
+verify-wallet: ## Vérifier sur la chaîne que le wallet détient bien ce qui a été livré
+	./scripts/verify_wallet.sh $(WALLET)
+
+.PHONY: demo-up
+demo-up: ## Démarrer le stack de production pour la démonstration
+	./scripts/prodtest.sh --local-chain
+
+.PHONY: demo-down
+demo-down: ## Tout démonter après la démonstration
+	./scripts/prodtest.sh --down
+
 .PHONY: testnet-wallet
 testnet-wallet: ## Générer un portefeuille de testnet (à financer par un robinet)
 	./scripts/gen_testnet_wallet.py
