@@ -1,0 +1,105 @@
+name: CI
+
+# Runs on the Python the production image runs. A suite that passes on a
+# different interpreter than the one that ships is testing something else.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Dependency advisories appear after a build passes, so re-check weekly
+    # rather than only when someone happens to open a pull request.
+    - cron: "0 6 * * 1"
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    name: Tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-prod.txt
+          pip install -e ".[test]"
+
+      - name: Lint
+        run: flake8 src/gateway src/libfin tests --max-line-length=120
+
+      - name: Tests
+        run: PYTHONPATH=src pytest tests -q
+
+      - name: Schema matches the models
+        # Catches a model change committed without its migration — otherwise
+        # discovered at the first write against a real database.
+        env:
+          DATABASE_URL: sqlite:///./ci-schema.db
+        run: |
+          python scripts/migrate.py
+          python scripts/migrate.py --check
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install scanners
+        run: pip install bandit pip-audit
+
+      - name: Static analysis
+        # Medium and above fail the build; low findings are reported and
+        # reviewed rather than blocking every commit.
+        run: bandit -r src/gateway src/libfin -ll
+
+      - name: Dependency advisories
+        run: pip-audit -r requirements-prod.txt --strict
+
+      - name: No secrets committed
+        # The private TLS key that reached this repository's history is exactly
+        # what this step exists to prevent happening twice.
+        run: |
+          set -e
+          if git ls-files | grep -E '\.(key|pem|p12|pfx)$'; then
+            echo "::error::A key or certificate file is tracked. Remove it with git rm --cached."
+            exit 1
+          fi
+          if git ls-files | grep -E '^\.env$|^\.env\.prod$'; then
+            echo "::error::A real environment file is tracked."
+            exit 1
+          fi
+          echo "No key material or environment files are tracked."
+
+  image:
+    name: Production image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t gateway:ci -f Containerfile.prod .
+
+      - name: The image must not carry secrets
+        run: |
+          set -e
+          if docker run --rm gateway:ci sh -c 'ls /app/.env* 2>/dev/null'; then
+            echo "::error::An environment file was baked into the image."
+            exit 1
+          fi
+          echo "No environment files in the image."
+
+      - name: Migrations shipped
+        run: docker run --rm gateway:ci sh -c 'test -f /app/alembic.ini && ls /app/migrations/versions/ | head -3'
