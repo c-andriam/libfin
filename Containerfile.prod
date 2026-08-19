@@ -58,7 +58,10 @@ COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
-COPY pyproject.toml setup.cfg /app/
+# Migrations ship with the image so the schema step runs the exact revisions
+# this build expects, rather than whatever happens to be on the host.
+COPY migrations/ /app/migrations/
+COPY alembic.ini pyproject.toml setup.cfg /app/
 
 # Unprivileged runtime user. A fixed uid keeps volume ownership predictable
 # across rebuilds; 10001 avoids colliding with the host's first real user.

@@ -195,33 +195,6 @@ clean-all: clean clean-build docs-clean ## Nettoyage complet (tout)
 	@echo "  ✔ Nettoyage complet effectué"
 
 # ──────────────────────────────────────────────────────────────
-#  Infrastructure (Podman & Vault)
-# ──────────────────────────────────────────────────────────────
-.PHONY: infra-build
-infra-build: ## Construire l'image Podman du Gateway
-	podman build -t gateway:latest -f Containerfile .
-
-.PHONY: infra-up
-infra-up: ## Lancer les conteneurs de production
-	podman-compose up -d
-
-.PHONY: infra-dev
-infra-dev: ## Lancer les conteneurs (profil dev avec simulateur)
-	podman-compose --profile dev up -d
-
-.PHONY: infra-down
-infra-down: ## Arrêter et supprimer conteneurs et volumes
-	podman-compose down -v
-
-.PHONY: infra-vault
-infra-vault: ## Initialiser HashiCorp Vault (doit être exécuté après infra-up)
-	./scripts/vault_init.sh
-
-.PHONY: infra-logs
-infra-logs: ## Afficher les logs des conteneurs
-	podman-compose logs -f
-
-# ──────────────────────────────────────────────────────────────
 #  Certificats TLS
 # ──────────────────────────────────────────────────────────────
 .PHONY: certs
@@ -241,9 +214,16 @@ SIM_COMPOSE := podman-compose -f podman-compose.sim.yml --env-file .env.sim
 sim-build: ## Construire l'image de simulation
 	podman build -t gateway:sim -f Containerfile.prod .
 
+.PHONY: sim-migrate
+sim-migrate: ## Appliquer les migrations à la base de simulation
+	$(SIM_COMPOSE) exec gateway-api python /app/scripts/migrate.py
+
 .PHONY: sim
-sim: certs sim-build ## Lancer la simulation complète (build + up + déploiement du jeton)
+sim: certs sim-build ## Lancer la simulation complète (build + up + migration + jeton)
 	$(SIM_COMPOSE) up -d
+	@echo "  Application des migrations..."
+	@sleep 8
+	-$(SIM_COMPOSE) exec -T gateway-api python /app/scripts/migrate.py
 	@echo ""
 	@echo "  Attente de la chaîne locale et du déploiement du jeton..."
 	@$(SIM_COMPOSE) logs gateway-token-deployer 2>/dev/null | tail -5 || true
@@ -364,8 +344,24 @@ prod-preflight: ## Vérifier que tout est prêt (bloque si non)
 	./scripts/preflight_check.sh
 
 .PHONY: prod-migrate
-prod-migrate: ## Appliquer le schéma de base de données
+prod-migrate: ## Appliquer les migrations de schéma (Alembic)
 	$(PROD_COMPOSE) run --rm gateway-api python /app/scripts/migrate.py
+
+.PHONY: prod-migrate-sql
+prod-migrate-sql: ## Afficher le SQL des migrations sans l'exécuter (revue avant application)
+	$(PROD_COMPOSE) run --rm gateway-api python /app/scripts/migrate.py --sql
+
+.PHONY: prod-migrate-check
+prod-migrate-check: ## Vérifier que le schéma correspond aux modèles
+	$(PROD_COMPOSE) run --rm gateway-api python /app/scripts/migrate.py --check
+
+.PHONY: migration
+migration: ## Générer une révision (MSG="description du changement")
+	@test -n "$(MSG)" || { echo "  Usage: make migration MSG=\"ajout colonne X\""; exit 1; }
+	DATABASE_URL=$${DATABASE_URL:-sqlite:///$(PWD)/.migration-scratch.db} \
+		PYTHONPATH=$(SRC_DIR) $(PYTHON) -m alembic revision --autogenerate -m "$(MSG)"
+	@rm -f .migration-scratch.db
+	@echo "  ⚠  Relire la révision générée avant de l'appliquer."
 
 .PHONY: prod
 prod: prod-preflight prod-build ## Lancer la production (preflight → build → migrate → up)
@@ -449,9 +445,6 @@ security-audit: ## Analyse statique de sécurité et audit des dépendances
 # ──────────────────────────────────────────────────────────────
 #  Raccourcis
 # ──────────────────────────────────────────────────────────────
-.PHONY: all
-all: infra-build infra-up infra-vault ## Déploiement complet: build image, lancement, et init vault
-
 .PHONY: ci
 ci: install check coverage ## Pipeline CI : install → lint → tests → couverture
 	@echo ""

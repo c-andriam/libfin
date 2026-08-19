@@ -118,12 +118,53 @@ class Settings:
         self.acquirer_pos_data: str = _env("ACQUIRER_POS_DATA", "810101Y00000")
         self.acquirer_processing_code: str = _env("ACQUIRER_PROCESSING_CODE", "000000")
         self.acquirer_send_cvv: bool = _env_bool("ACQUIRER_SEND_CVV", True)
+        #: How money is taken.
+        #:   auth_capture  0100 hold, deliver, then 0220 capture — a failed
+        #:                 delivery releases a hold and owes nothing.
+        #:   purchase      0200 takes the money up front; every failure after
+        #:                 it needs a reversal, and a refused reversal leaves a
+        #:                 cardholder out of pocket.
+        #: auth_capture is the safer order and the default. Use purchase only
+        #: if your acquirer cannot separate the two.
+        self.acquirer_capture_mode: str = _env("ACQUIRER_CAPTURE_MODE", "auth_capture").lower()
+        if self.acquirer_capture_mode not in ("auth_capture", "purchase"):
+            raise ConfigError(
+                f"ACQUIRER_CAPTURE_MODE must be 'auth_capture' or 'purchase', "
+                f"got {self.acquirer_capture_mode!r}"
+            )
         #: Bitmap encoding on the wire. ISO 8583 permits both; which one your
         #: acquirer expects is part of their dialect, and getting it wrong means
         #: every message is rejected as unparseable. Cross-checking libfin
         #: against an independent implementation is what surfaced this as a
         #: decision rather than a default nobody had looked at.
         self.acquirer_hex_bitmap: bool = _env_bool("ACQUIRER_HEX_BITMAP", False)
+        #: Which ISO 8583 variant the acquirer's host speaks. Sets field
+        #: lengths, character encoding and bitmap form together — they are not
+        #: independent choices. See src/gateway/iso_dialect.py for the sources
+        #: each profile was checked against.
+        self.acquirer_dialect: str = _env("ACQUIRER_DIALECT", "iso87").lower()
+        #: Acquiring institution identification code (DE32) and card acceptor
+        #: name/location (DE43). Both mandatory; both assigned by the acquirer.
+        self.acquirer_institution_id: str = _env("ACQUIRER_INSTITUTION_ID")
+        #: DE43 components. Built positionally rather than configured as one
+        #: forty-character blob: a blob that is off by a character puts the city
+        #: in the middle of the merchant name, which nothing rejects and the
+        #: cardholder reads on their statement.
+        self.acquirer_name: str = _env("ACQUIRER_NAME")
+        self.acquirer_city: str = _env("ACQUIRER_CITY")
+        self.acquirer_state: str = _env("ACQUIRER_STATE")
+        #: Two-letter country code for DE43. ACQUIRER_COUNTRY is the numeric
+        #: ISO 4217-style code used elsewhere; these are not the same field.
+        self.acquirer_country_alpha: str = _env("ACQUIRER_COUNTRY_ALPHA", "US")
+        #: Point of service condition code (DE25). 59 identifies a transaction
+        #: as electronic commerce, which drives interchange and liability.
+        self.acquirer_pos_condition: str = _env("ACQUIRER_POS_CONDITION", "59")
+
+        #: Retained for deployments that already build DE43 themselves.
+        self.acquirer_name_location: str = _env("ACQUIRER_NAME_LOCATION")
+        #: Merchant category code (DE18), mandatory. 6051 is the usual
+        #: quasi-cash code for crypto purchases, but the acquirer assigns it.
+        self.acquirer_merchant_category: str = _env("ACQUIRER_MERCHANT_CATEGORY", "6051")
         #: Message encoding. latin_1 for ASCII hosts, cp500 for EBCDIC ones
         #: (still common on mainframe-backed acquirers).
         self.acquirer_encoding: str = _env("ACQUIRER_ENCODING", "latin_1")
@@ -154,7 +195,69 @@ class Settings:
         self.erc20_token_address: str = _env(
             "ERC20_TOKEN_ADDRESS", "0xdAC17F958D2ee523a2206206994597C13D831ec7"
         )
+        #: Where the rate comes from. "fixed" uses EXCHANGE_RATE below, which
+        #: is correct only for a stablecoin at parity; "chainlink" reads the
+        #: on-chain oracles over the Web3 connection already held.
+        self.rate_source: str = _env("RATE_SOURCE", "fixed").lower()
         self.exchange_rate: Decimal = _env_decimal("EXCHANGE_RATE", "1.0")
+        #: The pair to price the settlement token in, e.g. EUR/USD when taking
+        #: euros and settling in a dollar stablecoin.
+        #: Written FIAT/TOKEN — the currency taken, and the token delivered.
+        #: EUR/USDT means euros in, USDT out.
+        self.rate_pair: str = _env("RATE_PAIR", "USD/USDT")
+        #: The currency oracles publish against. Both legs of a cross are read
+        #: against it, so it has to be the one your feeds actually use.
+        self.rate_settlement_currency: str = _env("RATE_SETTLEMENT_CURRENCY", "USD")
+        #: Symbol of the token delivered. Used to build the rate pair for
+        #: whichever currency the customer is paying in.
+        self.rate_token_symbol: str = _env("RATE_TOKEN_SYMBOL", "USDT").upper()
+        #: RPC used for reading price oracles, when it differs from the one
+        #: transfers are signed against. Reading a feed costs nothing and
+        #: changes nothing, so a simulation settling on a local chain can still
+        #: price against the real oracles — which is the only way the live rate
+        #: path gets exercised through the whole stack rather than by a script.
+        self.rate_rpc_url: str = _env("RATE_RPC_URL")
+        #: How far a second, independent source may disagree before the quote is
+        #: refused. Two sources disagreeing means at least one is wrong and
+        #: there is no way to tell which. Zero disables the check.
+        self.rate_cross_check_tolerance: Decimal = _env_decimal("RATE_CROSS_CHECK_TOLERANCE", "0.02")
+        #: Set to "none" to run on the oracle alone.
+        self.rate_cross_check_source: str = _env("RATE_CROSS_CHECK_SOURCE", "coingecko").lower()
+        #: How long a quote is reused. An oracle on a daily heartbeat does not
+        #: need reading per request, and the off-chain check has a rate limit a
+        #: busy gateway would exhaust in a minute.
+        self.rate_cache_seconds: int = _env_int("RATE_CACHE_SECONDS", 30)
+        #: Margin over mid-market. The gateway never quotes mid: every payment
+        #: would then be a coin flip on which way the market moved between the
+        #: quote and the transfer, with nothing to absorb the losing half.
+        self.rate_spread: Decimal = _env_decimal("RATE_SPREAD", "0.01")
+        #: A quote is refused if the rate moved more than this since the last
+        #: one. A sharp market move and a broken oracle look identical from
+        #: here, and only one of them is safe to deliver against.
+        self.rate_max_movement: Decimal = _env_decimal("RATE_MAX_MOVEMENT", "0.10")
+        #: Multiplier on a feed's heartbeat to decide staleness. Above 1 by
+        #: design: a threshold *below* the heartbeat rejects readings that are
+        #: working exactly as intended and takes the gateway down by itself.
+        self.rate_staleness_margin: Decimal = _env_decimal("RATE_STALENESS_MARGIN", "1.5")
+        #: Per-pair overrides, "EUR/USD:90000,USDT/USD:90000".
+        self.rate_staleness_overrides: dict = {}
+        for entry in _env("RATE_STALENESS_OVERRIDES").split(","):
+            if ":" in entry:
+                pair, seconds = entry.split(":", 1)
+                try:
+                    self.rate_staleness_overrides[pair.strip()] = int(seconds)
+                except ValueError:
+                    raise ConfigError(f"RATE_STALENESS_OVERRIDES entry is not a number: {entry!r}")
+        #: Per-pair plausible ranges, "EUR/USD:0.5:2.0". Wide enough that
+        #: ordinary volatility passes and a decimal-place error does not.
+        self.rate_bounds: dict = {}
+        for entry in _env("RATE_BOUNDS", "USDT/USD:0.5:1.5,EUR/USD:0.5:2.0,GBP/USD:0.5:2.5").split(","):
+            parts = entry.split(":")
+            if len(parts) == 3:
+                try:
+                    self.rate_bounds[parts[0].strip()] = (Decimal(parts[1]), Decimal(parts[2]))
+                except Exception:
+                    raise ConfigError(f"RATE_BOUNDS entry is malformed: {entry!r}")
 
         # ── Gateway security & limits ───────────────────────────────────────
         self.api_key: str = _env("GATEWAY_API_KEY")
@@ -184,6 +287,24 @@ class Settings:
         # How long a PAN token stays available for a reversal.
         self.pan_token_ttl_sec: int = _env_int("PAN_TOKEN_TTL_SEC", 86400)
         self.reconciliation_interval_sec: int = _env_int("RECONCILIATION_INTERVAL_SEC", 900)
+        #: How often the outbox relay runs. Short: an unpublished row is a
+        #: payment that has been taken and not yet acted on.
+        self.outbox_relay_interval_sec: int = _env_int("OUTBOX_RELAY_INTERVAL_SEC", 30)
+        # ── Data retention ──────────────────────────────────────────────
+        #: Days before the identifying fields are stripped while the financial
+        #: record is kept. 90 is a common default; your regulator may differ.
+        self.retention_redact_days: int = _env_int("RETENTION_REDACT_DAYS", 90)
+        #: Days before the row is removed entirely. Must exceed the financial
+        #: record-keeping period you are held to — often seven years.
+        self.retention_delete_days: int = _env_int("RETENTION_DELETE_DAYS", 2555)
+        self.retention_batch_size: int = _env_int("RETENTION_BATCH_SIZE", 1000)
+        self.retention_interval_sec: int = _env_int("RETENTION_INTERVAL_SEC", 86400)
+
+        self.log_level: str = _env("LOG_LEVEL", "INFO").upper()
+        #: Structured JSON logs. These lines are meant to be queried — "every
+        #: CRITICAL naming a manual refund in the last hour" has to be a filter,
+        #: not a grep someone remembers to run.
+        self.log_json: bool = _env_bool("LOG_JSON", True)
         self.stale_transaction_minutes: int = _env_int("STALE_TRANSACTION_MINUTES", 15)
         # create_all is convenient in simulation; production uses migrations.
         self.auto_create_schema: bool = _env_bool("AUTO_CREATE_SCHEMA", not self.is_production)
@@ -193,8 +314,22 @@ class Settings:
         #: all. scripts/preflight_check.sh refuses this outright, so it cannot
         #: reach a system that serves real cardholders.
         self.allow_simulated_acquirer: bool = _env_bool("ALLOW_SIMULATED_ACQUIRER", False)
+        #: Permits a production-mode run against a local test chain. Separate
+        #: from the acquirer hatch on purpose: rehearsing against a real chain
+        #: with a simulated bank is a different proposition from simulating
+        #: both, and conflating them would let one flag excuse the other.
+        #: Refused outright by scripts/preflight_check.sh.
+        self.allow_simulated_chain: bool = _env_bool("ALLOW_SIMULATED_CHAIN", False)
 
     # ── Derived properties ──────────────────────────────────────────────────
+
+    def rate_bounds_for(self, pair: str):
+        """Plausible range for a pair, or (None, None) when none is configured."""
+        return self.rate_bounds.get(pair, (None, None))
+
+    @property
+    def uses_auth_capture(self) -> bool:
+        return self.acquirer_capture_mode == "auth_capture"
 
     @property
     def is_production(self) -> bool:
@@ -233,6 +368,29 @@ class Settings:
         require(self.bank_host, "BANK_HOST", "Point it at your acquirer.")
         require(self.acquirer_terminal_id, "ACQUIRER_TERMINAL_ID", "Supplied by your acquirer.")
         require(self.acquirer_merchant_id, "ACQUIRER_MERCHANT_ID", "Supplied by your acquirer.")
+        # Mandatory in an authorisation. A message without them is rejected by
+        # the host, so refusing to start is the cheaper failure.
+        require(
+            self.acquirer_institution_id,
+            "ACQUIRER_INSTITUTION_ID",
+            "DE32, mandatory. Assigned by your acquirer.",
+        )
+        if not self.acquirer_name_location:
+            require(self.acquirer_name, "ACQUIRER_NAME", "DE43, mandatory.")
+            require(self.acquirer_city, "ACQUIRER_CITY", "DE43, mandatory.")
+        require(
+            self.acquirer_merchant_category,
+            "ACQUIRER_MERCHANT_CATEGORY",
+            "DE18, mandatory. Confirm the code with your acquirer.",
+        )
+
+        from gateway.iso_dialect import DIALECTS
+
+        if self.acquirer_dialect not in DIALECTS:
+            problems.append(
+                f"ACQUIRER_DIALECT={self.acquirer_dialect!r} is not a known variant "
+                f"({', '.join(sorted(DIALECTS))})."
+            )
 
         for url in self.web3_rpc_urls:
             if PLACEHOLDER_PREFIX in url:
@@ -272,10 +430,25 @@ class Settings:
                 )
             else:
                 problems.append(f"BANK_HOST={self.bank_host} is a simulation host.")
-        if any(marker in url for url in self.web3_rpc_urls for marker in ("anvil", "hardhat")):
-            problems.append("WEB3_RPC_URL points at a local test chain.")
-        if self.web3_chain_id in (31337, 1337):
-            problems.append(f"WEB3_CHAIN_ID={self.web3_chain_id} is a local test chain.")
+        local_chain = any(
+            marker in url for url in self.web3_rpc_urls for marker in ("anvil", "hardhat")
+        ) or self.web3_chain_id in (31337, 1337)
+
+        if local_chain:
+            if self.allow_simulated_chain:
+                LOGGER.critical(
+                    f"ALLOW_SIMULATED_CHAIN is set: settling on chain "
+                    f"{self.web3_chain_id}, which is a local test network. No real "
+                    "value is moving. This must never be set on a system serving "
+                    "real cardholders."
+                )
+            else:
+                if self.web3_chain_id in (31337, 1337):
+                    problems.append(
+                        f"WEB3_CHAIN_ID={self.web3_chain_id} is a local test chain."
+                    )
+                else:
+                    problems.append("WEB3_RPC_URL points at a local test chain.")
 
         return problems
 

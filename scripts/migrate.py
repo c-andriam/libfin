@@ -1,105 +1,125 @@
 #!/usr/bin/env python3
 """
-Apply the database schema as an explicit, one-shot step.
+Apply the database schema.
 
-Production runs with ``AUTO_CREATE_SCHEMA=false`` so that several API workers
-starting at once cannot race each other creating tables, and so that schema
-changes are something a person decides to do rather than a side effect of a
-deploy.
-
-Scope: this creates what is missing and reports what exists. It does **not**
-alter or drop anything. Introduce Alembic before the first change to a column
-that already holds data — ``pip install alembic`` is already in the image, and
-``alembic init`` against ``gateway.models.Base`` is the natural next step.
+Delegates to Alembic. The previous version of this script created missing
+tables with ``create_all`` and refused to touch anything that already existed —
+honest about its limits, but it meant no column could ever change on a database
+holding real transactions. Alembic removes that ceiling.
 
 Usage:
-    python scripts/migrate.py            # create missing tables
-    python scripts/migrate.py --check    # report only, exit 1 if out of date
+    python scripts/migrate.py              # upgrade to the latest revision
+    python scripts/migrate.py --check      # report drift, change nothing
+    python scripts/migrate.py --sql        # print the SQL instead of running it
+    python scripts/migrate.py --history    # show the revision history
 """
 
 import argparse
-import asyncio
 import logging
 import os
+import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
-from sqlalchemy import inspect  # noqa: E402
-
-from gateway.database import engine  # noqa: E402
-from gateway.models import Base  # noqa: E402
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [migrate] %(levelname)s %(message)s")
 LOGGER = logging.getLogger("migrate")
 
 
-async def _inspect_schema() -> dict:
-    """Existing tables mapped to their column names."""
-
-    def collect(sync_conn):
-        inspector = inspect(sync_conn)
-        return {
-            table: {column["name"] for column in inspector.get_columns(table)}
-            for table in inspector.get_table_names()
-        }
-
-    async with engine.begin() as conn:
-        return await conn.run_sync(collect)
+def alembic(*args: str) -> int:
+    env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
+    return subprocess.call(
+        [sys.executable, "-m", "alembic", *args], cwd=os.path.abspath(ROOT), env=env
+    )
 
 
-async def migrate(check_only: bool) -> int:
-    existing = await _inspect_schema()
-    expected_tables = set(Base.metadata.tables)
-    missing_tables = expected_tables - set(existing)
+def check_drift() -> int:
+    """Report whether the models have moved ahead of the applied revisions.
 
-    # Columns added to a model after a table already exists are invisible to
-    # create_all — it creates tables, it never alters them. Without this check
-    # the application starts happily and fails at the first write, which for
-    # this system means mid-payment.
-    missing_columns = {}
-    for name, table in Base.metadata.tables.items():
-        if name in existing:
-            absent = {c.name for c in table.columns} - existing[name]
-            if absent:
-                missing_columns[name] = sorted(absent)
-
-    LOGGER.info(f"Expected tables: {sorted(expected_tables)}")
-    LOGGER.info(f"Existing tables: {sorted(existing)}")
-
-    if not missing_tables and not missing_columns:
+    ``alembic check`` compares the metadata against the database and exits
+    non-zero when a revision is missing. That is the signal a deploy pipeline
+    wants: refuse to start an application whose models no longer match its
+    schema, rather than discover it at the first write.
+    """
+    LOGGER.info("Comparing the models against the applied revisions...")
+    code = alembic("check")
+    if code == 0:
         LOGGER.info("The schema is up to date.")
-        await engine.dispose()
-        return 0
-
-    if missing_columns:
-        for table, columns in missing_columns.items():
-            LOGGER.error(f"Table '{table}' is missing column(s): {', '.join(columns)}")
+    else:
         LOGGER.error(
-            "Adding columns is beyond this script: it creates tables and never alters "
-            "them, so it cannot do this without risking the data already there. Use "
-            "Alembic, or in a disposable environment recreate the database "
-            "(`make sim-down` drops the simulation volumes)."
+            "The schema is behind the models. Generate a revision with:\n"
+            "    python -m alembic revision --autogenerate -m 'describe the change'\n"
+            "review the generated file, then apply it with: make prod-migrate"
         )
-        await engine.dispose()
+    return code
+
+
+def adopt_existing_schema() -> bool:
+    """Bring a database that predates Alembic under its control.
+
+    A schema created by ``create_all`` has the tables but no ``alembic_version``
+    row, so Alembic assumes nothing is applied and tries to create everything —
+    failing on the objects that already exist. Stamping the baseline records
+    "this database is already at the first revision" without running it.
+
+    Returns True when a stamp was applied. Only stamps when the expected tables
+    are genuinely there; an empty database is left alone so the migrations run
+    normally.
+    """
+    from sqlalchemy import create_engine, inspect, text
+
+    url = os.environ["DATABASE_URL"].replace("+asyncpg", "").replace("+aiosqlite", "")
+    engine = create_engine(url)
+    try:
+        with engine.connect() as conn:
+            tables = set(inspect(conn).get_table_names())
+            if "alembic_version" in tables or "transactions" not in tables:
+                return False
+
+            LOGGER.warning(
+                "The schema exists but is not tracked by Alembic — it predates "
+                "migrations. Stamping the baseline revision; no DDL will run for it."
+            )
+            conn.execute(text("SELECT 1"))
+    finally:
+        engine.dispose()
+
+    return alembic("stamp", "5e11e7026cb2") == 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Apply the gateway database schema.")
+    parser.add_argument("--check", action="store_true", help="Report drift; change nothing.")
+    parser.add_argument("--sql", action="store_true", help="Print the SQL instead of running it.")
+    parser.add_argument("--history", action="store_true", help="Show the revision history.")
+    parser.add_argument("--downgrade", metavar="REV", help="Roll back to a revision.")
+    args = parser.parse_args()
+
+    if not os.environ.get("DATABASE_URL"):
+        LOGGER.error("DATABASE_URL is not set.")
         return 1
 
-    if check_only:
-        LOGGER.error(f"Missing tables: {sorted(missing_tables)}")
-        await engine.dispose()
-        return 1
+    if args.history:
+        return alembic("history", "--verbose")
+    if args.check:
+        return check_drift()
+    if args.downgrade:
+        LOGGER.warning(f"Rolling back to {args.downgrade}. This can discard data.")
+        return alembic("downgrade", args.downgrade)
 
-    LOGGER.info(f"Creating: {sorted(missing_tables)}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    LOGGER.info("Schema applied.")
+    if args.sql:
+        # Offline mode: emit the statements for review before anything runs on a
+        # database holding real transactions.
+        return alembic("upgrade", "head", "--sql")
 
-    await engine.dispose()
-    return 0
+    adopt_existing_schema()
+
+    LOGGER.info("Upgrading to the latest revision...")
+    code = alembic("upgrade", "head")
+    LOGGER.info("Schema applied." if code == 0 else "Migration failed.")
+    return code
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Apply the gateway database schema.")
-    parser.add_argument("--check", action="store_true", help="Report only; do not create anything.")
-    args = parser.parse_args()
-    sys.exit(asyncio.run(migrate(args.check)))
+    sys.exit(main())

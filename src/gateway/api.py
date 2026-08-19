@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import logging
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,10 +19,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.acquirer import AcquirerService, AuthorizationTimeout
+from gateway.action_codes import describe, is_approved
 from gateway.circuit_breaker import web3_circuit_breaker
 from gateway.config import settings
+from gateway.currency import UnsupportedCurrency, get as get_currency
 from gateway.database import async_session, engine, get_session, init_db
+from gateway.exchange_rate import RateUnavailable, apply_spread, build_rate_source
 from gateway.models import Transaction, TransactionStatus
+from gateway.outbox import enqueue, try_publish_now
+from gateway.observability import (
+    configure_logging,
+    correlation_id,
+    new_correlation_id,
+    transaction_id as transaction_id_var,
+)
 from gateway.pan_vault import get_pan_vault
 
 LOGGER = logging.getLogger(__name__)
@@ -118,6 +129,7 @@ def expiry_is_valid(expiry: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging(settings.log_level, structured=settings.log_json)
     if settings.is_production:
         settings.require_valid()
     LOGGER.info(f"Starting gateway: {settings.summary()}")
@@ -153,6 +165,29 @@ if settings.docs_enabled:
 
 
 @app.middleware("http")
+async def attach_correlation_id(request: Request, call_next):
+    """Give every request an identifier and hand it back in the response.
+
+    Registered last, which in Starlette means it runs first — an unauthenticated
+    or rate-limited request is exactly the kind worth tracing, so it must be
+    stamped before any other middleware can reject it.
+    """
+    incoming = request.headers.get("X-Correlation-Id", "")
+    cid = incoming if re.fullmatch(r"[A-Za-z0-9_-]{8,64}", incoming or "") else new_correlation_id()
+
+    token = correlation_id.set(cid)
+    tx_token = transaction_id_var.set(None)
+    try:
+        request.state.correlation_id = cid
+        response = await call_next(request)
+        response.headers["X-Correlation-Id"] = cid
+        return response
+    finally:
+        correlation_id.reset(token)
+        transaction_id_var.reset(tx_token)
+
+
+@app.middleware("http")
 async def authenticate_api_key(request: Request, call_next):
     if not settings.api_key:
         if settings.is_production:
@@ -185,7 +220,22 @@ class PaymentRequest(BaseModel):
     expiry: str = Field(..., pattern=r"^\d{4}$", description="Expiry date, YYMM")
     cvv: str = Field(..., pattern=r"^\d{3,4}$", description="Card Verification Value")
     amount: Decimal = Field(..., gt=0, decimal_places=2, description="Fiat amount")
+    #: ISO 4217 alphabetic. Explicit rather than assumed: an amount without a
+    #: currency is ambiguous, and the ambiguity is only ever resolved wrongly.
+    currency: str = Field(
+        default="USD",
+        pattern=r"^[A-Za-z]{3}$",
+        description="ISO 4217 currency of the amount, e.g. USD, EUR, GBP",
+    )
     target_wallet: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+
+    @field_validator("currency")
+    @classmethod
+    def supported(cls, value: str) -> str:
+        try:
+            return get_currency(value).alpha
+        except UnsupportedCurrency as exc:
+            raise ValueError(str(exc))
 
     @field_validator("amount")
     @classmethod
@@ -202,6 +252,12 @@ class PaymentRequest(BaseModel):
         if not expiry_is_valid(value):
             raise ValueError("Card has expired.")
         return value
+
+
+#: Idempotency keys are echoed into logs and stored in a VARCHAR(64). An
+#: unvalidated header therefore turns a client mistake into a 500 from the
+#: database layer, and puts arbitrary caller-supplied text in the log stream.
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{8,64}$")
 
 
 class PaymentResponse(BaseModel):
@@ -237,8 +293,7 @@ async def health_ready(db: AsyncSession = Depends(get_session)):
         checks["database"] = "error"
 
     try:
-        pan_vault = get_pan_vault()
-        await pan_vault.client.ping()
+        await get_pan_vault().ping()
         checks["redis"] = "ok"
     except Exception as exc:
         LOGGER.error(f"Readiness: Redis unreachable: {exc}")
@@ -276,6 +331,43 @@ async def health_ready(db: AsyncSession = Depends(get_session)):
 # ---------------------------------------------------------------------------
 # Payment
 # ---------------------------------------------------------------------------
+
+
+#: Built once per process. Chainlink needs a Web3 connection; the fixed source
+#: needs nothing. Cached because it holds a per-pair movement reference that
+#: only means something across successive quotes.
+_rate_source = None
+_rate_source_lock = asyncio.Lock()
+
+
+async def get_rate_source():
+    global _rate_source
+    if _rate_source is None:
+        async with _rate_source_lock:
+            if _rate_source is None:
+                if settings.rate_source == "fixed":
+                    _rate_source = await asyncio.to_thread(build_rate_source)
+                else:
+                    from gateway.crypto_service import CryptoService
+
+                    if settings.rate_rpc_url:
+                        # A separate, read-only connection for prices. Kept
+                        # apart from the signing connection on purpose: the
+                        # chain money settles on and the chain prices are read
+                        # from need not be the same, and a rate lookup must
+                        # never be able to touch a key.
+                        from web3 import Web3
+
+                        rate_w3 = Web3(
+                            Web3.HTTPProvider(
+                                settings.rate_rpc_url, request_kwargs={"timeout": 20}
+                            )
+                        )
+                        _rate_source = build_rate_source(rate_w3)
+                    else:
+                        service = await asyncio.to_thread(CryptoService)
+                        _rate_source = build_rate_source(service.w3)
+    return _rate_source
 
 
 #: Cached answer to "can this gateway sign a transfer right now?", with the
@@ -334,7 +426,7 @@ async def _fail_transaction(tx_id: int, status: TransactionStatus, reason: str) 
     async with async_session() as session:
         tx = await session.get(Transaction, tx_id)
         if tx is not None:
-            tx.status = status
+            tx.transition_to(status)
             tx.error_message = reason[:512]
             await session.commit()
 
@@ -377,6 +469,15 @@ async def process_payment(
         )
 
     # ── Idempotency ─────────────────────────────────────────────────────────
+    if idempotency_key is not None and not IDEMPOTENCY_KEY_PATTERN.match(idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Idempotency-Key must be 8 to 64 characters, using letters, digits, "
+                "and any of _ . : -"
+            ),
+        )
+
     if idempotency_key:
         async with async_session() as session:
             existing = (
@@ -394,9 +495,29 @@ async def process_payment(
         LOGGER.warning("Rejected a card number that fails the Luhn check.")
         raise HTTPException(status_code=400, detail="Invalid card number.")
 
+    # ── Lock the rate before anything is authorised ─────────────────────────
+    # Quoted here and recorded on the transaction, so delivery uses this rate
+    # and not a fresh lookup. A rate that moved in between would hand the
+    # customer something other than what they agreed to, and a retry days later
+    # would use a rate from a different world entirely.
+    # The pair follows the currency the customer is paying in, not a single
+    # value fixed for the whole deployment.
+    rate_pair = f"{payment_req.currency}/{settings.rate_token_symbol}"
+    try:
+        rate_source = await get_rate_source()
+        quote = apply_spread(await rate_source.quote(rate_pair))
+    except RateUnavailable as exc:
+        # No fallback to a constant. A gateway that quietly reverts to a stale
+        # or made-up rate delivers wrong amounts and says nothing.
+        LOGGER.error(f"Refusing the payment: no usable rate for {rate_pair} ({exc})")
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable. No funds were debited.",
+        )
+
     masked = mask_pan(payment_req.pan)
     LOGGER.info(
-        f"Payment request: {payment_req.amount} {settings.acquirer_currency} "
+        f"Payment request: {payment_req.amount} {payment_req.currency} "
         f"from {masked} to {payment_req.target_wallet}"
     )
 
@@ -404,11 +525,14 @@ async def process_payment(
     async with async_session() as session:
         transaction = Transaction(
             amount=payment_req.amount,
-            currency=settings.acquirer_currency,
+            currency=get_currency(payment_req.currency).numeric,
             masked_pan=masked,
             target_wallet=payment_req.target_wallet,
             idempotency_key=idempotency_key,
             status=TransactionStatus.PENDING,
+            exchange_rate=quote.rate,
+            exchange_rate_source=quote.source[:64],
+            exchange_rate_at=datetime.fromtimestamp(quote.observed_at, timezone.utc),
         )
         session.add(transaction)
         try:
@@ -428,6 +552,7 @@ async def process_payment(
             return _duplicate_response(existing)
         await session.refresh(transaction)
         tx_id = transaction.id
+    transaction_id_var.set(tx_id)
 
     # The worker needs the real PAN to reverse the payment if the crypto leg
     # fails, but it must not travel through the broker. Store it encrypted.
@@ -439,12 +564,21 @@ async def process_payment(
         raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
 
     # ── Fiat authorisation ──────────────────────────────────────────────────
+    # In auth_capture mode this places a hold and moves no money; the debit
+    # happens only once the crypto is confirmed on-chain. That ordering is what
+    # turns a delivery failure from "refund owed" into "hold released".
+    authorize = (
+        acquirer_service.authorize_only
+        if settings.uses_auth_capture
+        else acquirer_service.authorize_payment
+    )
     try:
-        response_iso = await acquirer_service.authorize_payment(
+        response_iso = await authorize(
             pan=payment_req.pan,
             amount=payment_req.amount,
             expiry=payment_req.expiry,
             cvv=payment_req.cvv,
+            currency=payment_req.currency,
         )
     except AuthorizationTimeout as timeout:
         # We do not know whether the cardholder was debited. Flag it and let the
@@ -455,18 +589,24 @@ async def process_payment(
         )
         async with async_session() as session:
             tx = await session.get(Transaction, tx_id)
-            tx.status = TransactionStatus.FIAT_UNKNOWN
+            tx.transition_to(TransactionStatus.FIAT_UNKNOWN)
             tx.stan = timeout.stan
             tx.rrn = timeout.rrn
             tx.error_message = "No response from the acquirer."
+
+            # Through the outbox for the same reason as the transfer: this is
+            # the branch where the cardholder may already have been debited, so
+            # losing the reversal is the worst outcome in the system.
+            recovery = enqueue(
+                session,
+                task_name="retry_reversal",
+                payload={"tx_id": tx_id, "correlation_id": correlation_id.get()},
+                countdown=5,
+            )
             await session.commit()
+            recovery_id = recovery.id
 
-        from gateway.worker import retry_reversal
-
-        try:
-            retry_reversal.apply_async(args=[tx_id], countdown=5)
-        except Exception as exc:
-            LOGGER.critical(f"Could not queue the reversal for transaction {tx_id}: {exc}")
+        await try_publish_now(recovery_id)
         raise HTTPException(status_code=504, detail="Bank network did not respond.")
 
     except Exception as exc:
@@ -485,41 +625,55 @@ async def process_payment(
         tx.action_code = action_code
         tx.auth_code = str(response_iso.get("DE38", "")) or None
 
-        if action_code != "00":
-            LOGGER.warning(f"Transaction {tx_id} declined by the bank (code {action_code}).")
+        if not is_approved(action_code):
+            LOGGER.warning(
+                f"Transaction {tx_id} declined by the bank: {describe(action_code)}."
+            )
             tx.mark_completed(TransactionStatus.FIAT_DECLINED)
             await session.commit()
             await get_pan_vault().purge(tx_id)
             raise HTTPException(status_code=400, detail="Payment declined by the bank.")
 
-        tx.status = TransactionStatus.FIAT_APPROVED
-        await session.commit()
+        approved_state = (
+            TransactionStatus.FIAT_AUTHORIZED
+            if settings.uses_auth_capture
+            else TransactionStatus.FIAT_APPROVED
+        )
+        tx.transition_to(approved_state)
 
-    LOGGER.info(f"Fiat approved for transaction {tx_id} (STAN {stan}).")
+        # The dispatch intent is written here, in the same commit as the state
+        # change. Publishing to the broker afterwards is a separate, retryable
+        # step reading from a durable row — so a process that dies between the
+        # two leaves a record of work to do rather than a charged card with
+        # nothing queued against it.
+        message = enqueue(
+            session,
+            task_name="process_crypto_transfer",
+            payload={"tx_id": tx_id, "correlation_id": correlation_id.get()},
+        )
+        await session.commit()
+        message_id = message.id
+
+    LOGGER.info(
+        f"Transaction {tx_id} {approved_state.value} (STAN {stan})."
+        + (" No money has moved yet." if settings.uses_auth_capture else "")
+    )
 
     # ── Hand the crypto leg to the worker ───────────────────────────────────
-    from gateway.worker import process_crypto_transfer
-
-    try:
-        process_crypto_transfer.apply_async(kwargs={"tx_id": tx_id})
-    except Exception as exc:
-        # The broker is down and the card has been charged. Reverse it now
-        # rather than leave the customer paying for nothing.
-        LOGGER.critical(f"Could not queue the crypto transfer for transaction {tx_id}: {exc}")
-        from gateway.worker import _reverse_transaction
-
-        try:
-            await _reverse_transaction(tx_id, reason="crypto transfer could not be queued")
-        except Exception as reversal_exc:
-            LOGGER.critical(
-                f"MANUAL ACTION REQUIRED — transaction {tx_id} was charged but neither "
-                f"queued nor reversed: {reversal_exc}"
-            )
-        raise HTTPException(status_code=503, detail="Service temporarily unavailable.")
+    # An optimisation, not the guarantee: the work is already durably recorded
+    # above. If the broker is unreachable the relay publishes it on its next
+    # pass, so a broker outage delays a payment instead of stranding it — and
+    # the customer is not told to try again for something already in hand.
+    await try_publish_now(message_id)
 
     return PaymentResponse(
-        status=TransactionStatus.FIAT_APPROVED.value,
-        message="Fiat payment approved. The crypto transfer is being processed.",
+        status=approved_state.value,
+        message=(
+            "Card authorised. The crypto transfer is being processed; the card is "
+            "charged once it is confirmed."
+            if settings.uses_auth_capture
+            else "Fiat payment approved. The crypto transfer is being processed."
+        ),
         transaction_id=tx_id,
         fiat_amount=payment_req.amount,
         stan=stan,

@@ -41,18 +41,29 @@ LOGGER = logging.getLogger("bank-simulator")
 
 APPROVED = "00"
 
-# Match the gateway's dialect so the simulator exercises the same encoding the
-# acquirer will see, not merely the library defaults.
-HEX_BITMAP = os.environ.get("SIM_HEX_BITMAP", "").lower() in ("1", "true", "yes")
-ENCODING = os.environ.get("SIM_ENCODING", "latin_1")
+# The simulator speaks the acquirer's dialect, not the library's defaults.
+# Field lengths differ between variants, and a mismatch does not degrade
+# gracefully — it shifts every byte after the offending field. A simulator on a
+# different dialect would silently fail to decode perfectly valid messages,
+# which is a confusing way to discover a configuration problem.
+from gateway.iso_dialect import get_dialect  # noqa: E402
+
+DIALECT = get_dialect(os.environ.get("SIM_DIALECT", os.environ.get("ACQUIRER_DIALECT", "iso87")))
+HEX_BITMAP = os.environ.get("SIM_HEX_BITMAP", "").lower() in ("1", "true", "yes") or DIALECT.hex_bitmap
+ENCODING = os.environ.get("SIM_ENCODING") or DIALECT.encoding
+_BIT_CONFIG = DIALECT.bit_config()
 
 
 def dumps(message: dict) -> bytes:
-    return iso8583.dumps(message, encoding=ENCODING, hex_bitmap=HEX_BITMAP)
+    return iso8583.dumps(
+        message, encoding=ENCODING, hex_bitmap=HEX_BITMAP, iso_config=_BIT_CONFIG
+    )
 
 
 def loads(raw: bytes) -> dict:
-    return iso8583.loads(raw, encoding=ENCODING, hex_bitmap=HEX_BITMAP)
+    return iso8583.loads(
+        raw, encoding=ENCODING, hex_bitmap=HEX_BITMAP, iso_config=_BIT_CONFIG
+    )
 
 
 # PAN -> (action code, behaviour)
@@ -68,6 +79,9 @@ SLOW_DELAY = float(os.environ.get("SIM_SLOW_DELAY", "15"))
 
 #: STANs whose reversal must be refused, populated when a 0200 is approved.
 _reject_reversal_stans: set = set()
+#: Authorisations holding funds, awaiting a capture or a void. A real acquirer
+#: expires these after about a week; the simulator keeps them for the session.
+_held_stans: set = set()
 _auth_count = 0
 
 
@@ -95,8 +109,12 @@ async def _handle_authorization(msg: dict) -> bytes:
     if behaviour == "reject_reversal":
         _reject_reversal_stans.add(stan)
 
+    mti = str(msg.get("MTI", "0200"))
     response = dict(msg)
-    response["MTI"] = "0210"
+    # A 0100 only holds funds; a 0200 takes them there and then.
+    response["MTI"] = "0110" if mti == "0100" else "0210"
+    if mti == "0100" and action_code == APPROVED:
+        _held_stans.add(stan)
     response["DE39"] = action_code
     if action_code == APPROVED:
         response["DE38"] = _auth_code(stan)
@@ -105,6 +123,67 @@ async def _handle_authorization(msg: dict) -> bytes:
         LOGGER.info(f"STAN={stan}: declined with {action_code}.")
 
     # An acquirer echoes the retrieval reference number back untouched.
+    return dumps(response)
+
+
+async def _handle_capture(msg: dict) -> bytes:
+    """Completion advice: turn a hold into a debit.
+
+    0120 completes a 0100 preauthorisation; 0220 is the advice for a 0200
+    financial transaction. Both are handled because the gateway picks whichever
+    matches its capture mode, and answering only one would make the other look
+    like a gateway fault rather than a simulator gap.
+    """
+    mti = str(msg.get("MTI", "0220"))
+    stan = str(msg.get("DE11", "")).zfill(6)
+    original = str(msg.get("DE90", ""))
+    original_stan = original[4:10] if len(original) >= 10 else ""
+
+    response = dict(msg)
+    # The reply is the request's MTI with the last digit stepped: 0120→0130,
+    # 0220→0230.
+    response["MTI"] = mti[:3] + "3" if mti.startswith("01") else "0230"
+
+    if original_stan in _held_stans:
+        _held_stans.discard(original_stan)
+        LOGGER.info(f"STAN={stan}: captured authorisation {original_stan}.")
+        response["DE39"] = APPROVED
+    elif not original_stan:
+        LOGGER.error(f"STAN={stan}: capture without usable original data elements.")
+        response["DE39"] = "30"
+    else:
+        # No matching hold: either already captured, or never authorised. A real
+        # acquirer distinguishes these; the simulator refuses both.
+        LOGGER.warning(f"STAN={stan}: no open hold for {original_stan}.")
+        response["DE39"] = "12"
+
+    return dumps(response)
+
+
+async def _handle_void(msg: dict) -> bytes:
+    """0420 reversal advice: release a hold without ever debiting."""
+    stan = str(msg.get("DE11", "")).zfill(6)
+    original = str(msg.get("DE90", ""))
+    original_stan = original[4:10] if len(original) >= 10 else ""
+    pan = str(msg.get("DE2", ""))
+
+    response = dict(msg)
+    response["MTI"] = "0430"
+
+    if "*" in pan or not pan.isdigit():
+        LOGGER.error(f"STAN={stan}: void carries an unusable PAN.")
+        response["DE39"] = "30"
+    elif original_stan in _reject_reversal_stans:
+        LOGGER.warning(f"STAN={stan}: refusing the void of {original_stan} (scenario).")
+        response["DE39"] = "96"
+    elif original_stan in _held_stans:
+        _held_stans.discard(original_stan)
+        LOGGER.info(f"STAN={stan}: released the hold on {original_stan}; nothing debited.")
+        response["DE39"] = APPROVED
+    else:
+        LOGGER.warning(f"STAN={stan}: no open hold for {original_stan}.")
+        response["DE39"] = "12"
+
     return dumps(response)
 
 
@@ -123,8 +202,11 @@ async def _handle_reversal(msg: dict) -> bytes:
         LOGGER.error(f"STAN={stan}: reversal carries an unusable PAN {pan!r}; rejecting.")
         response["DE39"] = "30"  # format error
     elif original_stan in _reject_reversal_stans:
+        # 21 is "Reversal Unsuccessful" — a decline. Used here deliberately
+        # because the gateway once read it as success and recorded a refund
+        # that never happened; the simulator should be able to reproduce that.
         LOGGER.warning(f"STAN={stan}: refusing the reversal of {original_stan} (scenario).")
-        response["DE39"] = "96"  # system malfunction
+        response["DE39"] = "21"
     elif not original_stan:
         LOGGER.error(f"STAN={stan}: reversal without usable original data elements.")
         response["DE39"] = "30"
@@ -154,8 +236,19 @@ async def handle_message(msg_bytes: bytes) -> bytes:
     LOGGER.debug(f"Received MTI={mti} STAN={msg.get('DE11')}")
 
     try:
-        if mti == "0200":
+        if mti in ("0200", "0100"):
             return await _handle_authorization(msg)
+        if mti in ("0120", "0220"):
+            return await _handle_capture(msg)
+        if mti == "0420":
+            # A reversal advice against an open hold releases it; against a
+            # captured transaction it is a refund. The simulator tells them
+            # apart by whether a hold is still outstanding.
+            original = str(msg.get("DE90", ""))
+            original_stan = original[4:10] if len(original) >= 10 else ""
+            if original_stan in _held_stans:
+                return await _handle_void(msg)
+            return await _handle_reversal(msg)
         if mti == "0400":
             return await _handle_reversal(msg)
         if mti == "0800":

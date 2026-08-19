@@ -249,3 +249,8 @@ testnet-wallet.json
 # acquirer-certs/
 # .prodtest.lock
 # .prodtest-token
+.migration-scratch.db
+.alembic-*.db
+
+# Résultats de validation (suites de chaos, charge). Conservés hors /tmp.
+.validation/*.log

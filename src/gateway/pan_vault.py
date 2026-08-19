@@ -27,6 +27,10 @@ import redis.asyncio as redis
 from cryptography.fernet import Fernet, InvalidToken
 
 from gateway.config import ConfigError, settings
+from gateway.redis_client import RETRYABLE, async_client
+
+#: Errors that mean "this connection is gone", as opposed to "Redis said no".
+_RECOVERABLE = tuple(RETRYABLE)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,19 +111,44 @@ class PanVault:
             self._redis = None
 
         if self._redis is None:
-            self._redis = redis.from_url(self._redis_url)
+            self._redis = async_client(self._redis_url)
             self._redis_loop = loop
 
         return self._redis
 
+    def _discard_client(self) -> None:
+        """Drop the cached client so the next call builds a fresh one.
+
+        The library's own retry policy reconnects within a command, but a
+        connection killed while idle in the pool of a long-lived process can
+        stay poisoned: observed after a Redis restart, where a brand-new client
+        connected fine while the running API reported it unreachable for as long
+        as it was left running. Rebuilding on error is self-healing, and does
+        not depend on the exact reconnection semantics of a library version.
+        """
+        self._redis = None
+        self._redis_loop = None
+
+    async def _call(self, operation: str, *args, **kwargs):
+        """Run a Redis command, replacing the client once if it has gone stale."""
+        try:
+            return await getattr(self.client, operation)(*args, **kwargs)
+        except _RECOVERABLE as exc:
+            LOGGER.warning(f"Redis {operation} failed ({exc}); rebuilding the client and retrying.")
+            self._discard_client()
+            return await getattr(self.client, operation)(*args, **kwargs)
+
+    async def ping(self) -> bool:
+        return bool(await self._call("ping"))
+
     async def store(self, tx_id: int, pan: str, ttl_sec: Optional[int] = None) -> None:
         token = self._fernet.encrypt(pan.encode())
-        await self.client.setex(
-            f"{_KEY_PREFIX}{tx_id}", ttl_sec or settings.pan_token_ttl_sec, token
+        await self._call(
+            "setex", f"{_KEY_PREFIX}{tx_id}", ttl_sec or settings.pan_token_ttl_sec, token
         )
 
     async def retrieve(self, tx_id: int) -> Optional[str]:
-        token = await self.client.get(f"{_KEY_PREFIX}{tx_id}")
+        token = await self._call("get", f"{_KEY_PREFIX}{tx_id}")
         if not token:
             LOGGER.error(
                 f"No stored PAN for transaction {tx_id}: it expired or was already purged. "
@@ -137,7 +166,7 @@ class PanVault:
 
     async def purge(self, tx_id: int) -> None:
         try:
-            await self.client.delete(f"{_KEY_PREFIX}{tx_id}")
+            await self._call("delete", f"{_KEY_PREFIX}{tx_id}")
         except Exception as exc:
             LOGGER.warning(f"Could not purge the stored PAN for transaction {tx_id}: {exc}")
 

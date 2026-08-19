@@ -24,22 +24,44 @@ from typing import Optional, Tuple
 
 import redis.asyncio as redis
 from web3 import Web3
+from web3.exceptions import TimeExhausted
 
 from gateway.config import settings
+from gateway.redis_client import async_client
 
 LOGGER = logging.getLogger(__name__)
 
 # Minimal ERC-20 ABI: transfer, decimals, balanceOf.
+#
+# The transfer entry exists in two forms because the largest token this gateway
+# is likely to move does not follow the standard. USDT
+# (0xdAC17F958D2ee523a2206206994597C13D831ec7) predates ERC-20 being finalised
+# and its transfer returns nothing at all — verified against mainnet, where an
+# eth_call to it comes back as `0x`, zero bytes, rather than an encoded bool.
+#
+# Encoding a call does not consult the outputs, so declaring a bool that is
+# never returned is harmless while the only thing done with transfer is to
+# build a transaction. It stops being harmless the moment anyone adds a
+# pre-flight `.call()` to check a transfer would succeed — a natural thing to
+# reach for, which would then fail on USDT specifically and on nothing else.
+#
+# Success is taken from the receipt status either way. A token's own return
+# value is not evidence: the ones that return false on failure are exactly the
+# ones a caller forgets to check.
+_TRANSFER_RETURNS_BOOL = {
+    "constant": False,
+    "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}],
+    "name": "transfer",
+    "outputs": [{"name": "", "type": "bool"}],
+    "payable": False,
+    "stateMutability": "nonpayable",
+    "type": "function",
+}
+
+_TRANSFER_RETURNS_NOTHING = {**_TRANSFER_RETURNS_BOOL, "outputs": []}
+
 ERC20_ABI = [
-    {
-        "constant": False,
-        "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}],
-        "name": "transfer",
-        "outputs": [{"name": "", "type": "bool"}],
-        "payable": False,
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
+    _TRANSFER_RETURNS_BOOL,
     {
         "constant": True,
         "inputs": [],
@@ -64,6 +86,15 @@ ERC20_ABI = [
 #: count. A handful of transactions can be in flight at once; a hundred means
 #: the cache and the chain disagree about history.
 _MAX_NONCE_GAP = 50
+
+#: Tokens known to omit the boolean their interface implies. Detected at
+#: runtime as well; this list only avoids the probe for the common cases.
+NON_STANDARD_TRANSFER_TOKENS = frozenset(
+    {
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT, Ethereum mainnet
+        "0xdac17f958d2ee523a2206206994597c13d831ec7".upper(),
+    }
+)
 
 _NONCE_LOCK_KEY = "web3:nonce:lock:{address}"
 _NONCE_VALUE_KEY = "web3:nonce:next:{address}"
@@ -226,7 +257,7 @@ class CryptoService:
     @property
     def redis(self) -> redis.Redis:
         if self._redis is None:
-            self._redis = redis.from_url(self._redis_url)
+            self._redis = async_client(self._redis_url)
         return self._redis
 
     async def _acquire_nonce_lock(self, timeout_sec: float = 30.0) -> str:
@@ -291,6 +322,37 @@ class CryptoService:
             LOGGER.warning(f"Could not persist the next nonce ({exc}).")
 
     # ── Token helpers ───────────────────────────────────────────────────────
+
+    def _abi_for(self, token_address: str) -> list:
+        """The ABI matching this token's actual transfer signature."""
+        if token_address.lower() in NON_STANDARD_TRANSFER_TOKENS:
+            return [_TRANSFER_RETURNS_NOTHING] + ERC20_ABI[1:]
+        return ERC20_ABI
+
+    async def transfer_returns_bool(self, token_address: str) -> bool:
+        """Ask the chain whether this token's transfer returns anything.
+
+        A zero-value transfer to ourselves is the cheapest probe that reaches
+        the same code path a real transfer would, without moving anything or
+        costing gas — it is a call, not a transaction.
+        """
+        token_address = self.w3.to_checksum_address(token_address)
+        selector = self.w3.keccak(text="transfer(address,uint256)")[:4]
+        payload = (
+            selector
+            + bytes(12) + bytes.fromhex(self.account.address[2:])
+            + (0).to_bytes(32, "big")
+        )
+        try:
+            returned = await asyncio.to_thread(
+                self.w3.eth.call,
+                {"to": token_address, "from": self.account.address, "data": payload},
+            )
+            return len(returned) > 0
+        except Exception as exc:
+            # A revert says nothing about the return type; assume the standard.
+            LOGGER.debug(f"Could not probe {token_address} transfer signature: {exc}")
+            return True
 
     async def get_decimals(self, token_address: str) -> int:
         token_address = self.w3.to_checksum_address(token_address)
@@ -413,7 +475,7 @@ class CryptoService:
                 f"Hot wallet holds {balance} units, needs {token_units}. Top up the wallet."
             )
 
-        contract = self.w3.eth.contract(address=token_address, abi=ERC20_ABI)
+        contract = self.w3.eth.contract(address=token_address, abi=self._abi_for(token_address))
         lock_token = await self._acquire_nonce_lock()
         try:
             nonce = await self._next_nonce()
@@ -444,12 +506,99 @@ class CryptoService:
         )
         return tx_hash_hex, token_units, nonce
 
+    async def nonce_gap(self) -> int:
+        """How far our next nonce runs ahead of what the chain will accept.
+
+        A transaction signed at nonce N cannot be mined until every nonce below
+        it has been. If one was allocated and never broadcast — a worker killed
+        between the two, a dropped mempool — the gap is permanent: that
+        transaction stalls, and every payment after it queues behind a hole that
+        nothing fills on its own. Observed exactly that way, a hot wallet frozen
+        at nonce 509 with the chain still expecting 508.
+
+        Returns the number of missing nonces, or 0 when the queue is contiguous.
+        """
+        chain_nonce = await asyncio.to_thread(
+            self.w3.eth.get_transaction_count, self.account.address, "pending"
+        )
+        key = _NONCE_VALUE_KEY.format(address=self.account.address)
+        try:
+            cached = await self.redis.get(key)
+        except Exception:
+            return 0
+        if cached is None:
+            return 0
+        return max(0, int(cached) - chain_nonce)
+
+    async def fill_nonce_gap(self, max_fill: int = 10) -> int:
+        """Close a nonce gap with no-op self-transfers, cheapest first.
+
+        Each missing nonce is filled with a zero-value transfer to our own
+        address: the smallest transaction that can occupy a slot. It costs gas
+        and moves nothing, which is the point — it unblocks everything queued
+        behind it.
+
+        Bounded, because a gap large enough to need more than a handful of
+        fillers means the nonce bookkeeping is wrong in a way that filling will
+        not fix, and a human should look before spending more gas.
+        """
+        if not self.account:
+            raise ValueError("Crypto service has no private key configured.")
+
+        self.ensure_connected()
+        chain_nonce = await asyncio.to_thread(
+            self.w3.eth.get_transaction_count, self.account.address, "pending"
+        )
+        gap = await self.nonce_gap()
+        if gap == 0:
+            return 0
+
+        if gap > max_fill:
+            LOGGER.critical(
+                f"MANUAL ACTION REQUIRED — nonce gap of {gap} on "
+                f"{self.account.address}, beyond the {max_fill} this will fill "
+                "automatically. The nonce bookkeeping is wrong; do not simply "
+                "raise the limit."
+            )
+            gap = max_fill
+
+        filled = 0
+        for offset in range(gap):
+            nonce = chain_nonce + offset
+            try:
+                tx = {
+                    "nonce": nonce,
+                    "from": self.account.address,
+                    "to": self.account.address,
+                    "value": 0,
+                    "gas": 21000,
+                    "chainId": self.w3.eth.chain_id,
+                    **self._fee_parameters(),
+                }
+                signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
+                await asyncio.to_thread(
+                    self.w3.eth.send_raw_transaction, self._raw_bytes(signed)
+                )
+                filled += 1
+                LOGGER.warning(f"Filled nonce {nonce} with a no-op to unblock the queue.")
+            except Exception as exc:
+                # "already known" means the slot is occupied after all, which is
+                # the outcome we wanted.
+                if "already" in str(exc).lower():
+                    filled += 1
+                    continue
+                LOGGER.error(f"Could not fill nonce {nonce}: {exc}")
+                break
+
+        return filled
+
     async def replace_stuck_transfer(
         self,
         token_address: str,
         to_address: str,
         token_units: int,
         nonce: int,
+        attempt: int = 1,
     ) -> str:
         """Rebroadcast at the same nonce with higher fees.
 
@@ -457,6 +606,12 @@ class CryptoService:
         is neither delivered nor refundable, because the reversal guard sees it
         as still pending. The only way out is to replace it — same nonce, fees
         raised by at least ~10% or the network rejects the replacement.
+
+        ``attempt`` compounds the fee bump. Without it every retry reprices
+        against the same market and produces byte-identical transaction — the
+        node answers "transaction already imported" and the transfer stays
+        exactly as stuck as before. Each attempt has to bid strictly higher than
+        the last, not merely higher than the market.
 
         Returns the new hash. The old one becomes permanently unmineable, so
         exactly one of the two can ever land.
@@ -477,7 +632,9 @@ class CryptoService:
             "nonce": nonce,
             "from": self.account.address,
             "chainId": self.w3.eth.chain_id,
-            **self._fee_parameters(multiplier=settings.web3_replacement_multiplier),
+            **self._fee_parameters(
+                multiplier=settings.web3_replacement_multiplier ** max(1, attempt)
+            ),
         }
         call = contract.functions.transfer(to_address, token_units)
         tx = await asyncio.to_thread(call.build_transaction, tx_params)
@@ -495,11 +652,24 @@ class CryptoService:
         """Wait for the receipt, then for N further blocks. Bounded on both ends."""
         required = settings.web3_confirmations if confirmations is None else confirmations
 
-        receipt = await asyncio.to_thread(
-            self.w3.eth.wait_for_transaction_receipt,
-            tx_hash,
-            settings.web3_receipt_timeout_sec,
-        )
+        try:
+            receipt = await asyncio.to_thread(
+                self.w3.eth.wait_for_transaction_receipt,
+                tx_hash,
+                settings.web3_receipt_timeout_sec,
+            )
+        except TimeExhausted as exc:
+            # web3 raises TimeExhausted, which is a Web3Exception and *not* a
+            # TimeoutError. Callers reasonably catch TimeoutError to decide a
+            # transfer is stuck and needs replacing — and with the wrong type
+            # that branch is unreachable. It was: a transfer sat pending at a
+            # fixed nonce while the replacement logic written for exactly that
+            # case never ran once. Normalised here so the contract of this
+            # method matches what its name promises.
+            raise TimeoutError(
+                f"Transaction {tx_hash} was not mined within "
+                f"{settings.web3_receipt_timeout_sec}s."
+            ) from exc
         if receipt.status != 1:
             raise RuntimeError(f"Transaction reverted on-chain: {tx_hash}")
 

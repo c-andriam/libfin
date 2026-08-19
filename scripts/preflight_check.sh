@@ -117,6 +117,13 @@ else
     pass "No simulated-acquirer escape hatch is set."
 fi
 
+if [[ "${ALLOW_SIMULATED_CHAIN:-false}" == "true" ]]; then
+    block "ALLOW_SIMULATED_CHAIN=true. That flag lets production settle on a local \
+test network, where no value actually moves. It exists for rehearsals only. Remove it."
+else
+    pass "No simulated-chain escape hatch is set."
+fi
+
 [[ "${GATEWAY_MODE:-}" == "production" ]] \
     && pass "GATEWAY_MODE=production." \
     || block "GATEWAY_MODE must be 'production' (currently '${GATEWAY_MODE:-unset}')."
@@ -247,6 +254,78 @@ else
     warn "python3 not found; skipped the application's own validation."
 fi
 
+# ── 6b. Exchange rates ──────────────────────────────────────────────────────
+section "Exchange rates"
+
+if [[ "${RATE_SOURCE:-fixed}" == "fixed" ]]; then
+    warn "RATE_SOURCE=fixed uses the constant EXCHANGE_RATE=${EXCHANGE_RATE:-?}. \
+Correct only for a stablecoin at parity; anything else silently over- or \
+under-delivers on every transaction."
+else
+    pass "RATE_SOURCE=${RATE_SOURCE}."
+
+    if [[ "${SKIP_NETWORK}" == "1" ]]; then
+        info "Feed readability not checked (SKIP_NETWORK=1)."
+    else
+        # Read every feed the configured currencies need, through the same code
+        # the gateway uses. A rate source that cannot be read is a gateway that
+        # refuses every payment — better found here than by the first customer.
+        RATE_OUTPUT="$(PYTHONPATH=src python3 - <<'RATECHECK' 2>&1
+import asyncio, os, sys
+try:
+    from web3 import Web3
+    from gateway.config import settings
+    from gateway.currency import SUPPORTED
+    from gateway.exchange_rate import apply_spread, build_rate_source
+except Exception as exc:
+    print(f"SKIP:{exc}")
+    sys.exit(0)
+
+url = settings.rate_rpc_url or settings.web3_rpc_urls[0]
+try:
+    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+    source = build_rate_source(w3)
+except Exception as exc:
+    print(f"FAIL:could not build the rate source: {exc}")
+    sys.exit(0)
+
+async def main():
+    for alpha in sorted(SUPPORTED):
+        pair = f"{alpha}/{settings.rate_token_symbol}"
+        try:
+            quote = apply_spread(await source.quote(pair))
+            hours = quote.age_seconds // 3600
+            print(f"OK:{pair}:{quote.rate}:{hours}")
+        except Exception as exc:
+            print(f"PAIR_FAIL:{pair}:{exc}")
+
+asyncio.run(main())
+RATECHECK
+)"
+        while IFS= read -r line; do
+            case "${line}" in
+                OK:*)
+                    IFS=: read -r _ pair rate hours <<< "${line}"
+                    pass "${pair} = ${rate} (source last published ${hours}h ago)"
+                    ;;
+                PAIR_FAIL:*)
+                    detail="${line#PAIR_FAIL:}"
+                    warn "Cannot price ${detail%%:*}: ${detail#*:}. Payments in that \
+currency will be refused."
+                    ;;
+                FAIL:*)   block "Exchange rates unavailable: ${line#FAIL:}" ;;
+                SKIP:*)   info  "Rate check skipped here: ${line#SKIP:}" ;;
+            esac
+        done <<< "${RATE_OUTPUT}"
+    fi
+fi
+
+if [[ -n "${RATE_RPC_URL:-}" ]]; then
+    pass "Prices are read over a separate RPC; a rate lookup cannot touch the signing key."
+else
+    info "Prices are read over the signing RPC. Set RATE_RPC_URL to separate them."
+fi
+
 # ── 7. Connectivity ─────────────────────────────────────────────────────────
 section "Connectivity"
 
@@ -351,6 +430,44 @@ rootful with VAULT_DISABLE_MLOCK=false."
     else
         pass "Vault memory locking is off, but the host has no swap."
     fi
+fi
+
+# The API pools connections per Gunicorn worker, so demand multiplies by the
+# worker count. Exceeding the database's limit does not degrade — Postgres
+# answers "sorry, too many clients already" and the payment fails.
+POOL_SIZE="${DB_POOL_SIZE:-10}"
+MAX_OVERFLOW="${DB_MAX_OVERFLOW:-10}"
+WEB_WORKERS="${WEB_CONCURRENCY:-4}"
+CELERY_WORKERS="${CELERY_CONCURRENCY:-4}"
+
+# Celery uses NullPool (one connection per session, released immediately), so
+# its demand tracks concurrency rather than pool size. Beat and the occasional
+# migration or admin session round it up.
+API_DEMAND=$(( (POOL_SIZE + MAX_OVERFLOW) * WEB_WORKERS ))
+PEAK_DEMAND=$(( API_DEMAND + CELERY_WORKERS * 2 + 5 ))
+
+info "Peak database connections: ${API_DEMAND} from the API + workers ≈ ${PEAK_DEMAND}"
+
+if [[ "${SKIP_NETWORK}" != "1" ]] && command -v podman >/dev/null 2>&1; then
+    DB_MAX="$(podman exec gateway-postgres-prod psql -U gateway -d gateway_db -t \
+        -c 'SHOW max_connections;' 2>/dev/null | tr -d ' ' || true)"
+    RESERVED="$(podman exec gateway-postgres-prod psql -U gateway -d gateway_db -t \
+        -c 'SHOW superuser_reserved_connections;' 2>/dev/null | tr -d ' ' || true)"
+    if [[ -n "${DB_MAX}" ]]; then
+        USABLE=$(( DB_MAX - ${RESERVED:-3} ))
+        if (( PEAK_DEMAND > USABLE )); then
+            block "The stack can demand ${PEAK_DEMAND} database connections but only \
+${USABLE} are usable (max_connections=${DB_MAX}, ${RESERVED:-3} reserved). Under load \
+Postgres refuses the excess and those payments fail. Lower DB_POOL_SIZE or \
+WEB_CONCURRENCY, or raise max_connections."
+        else
+            pass "Connection demand (${PEAK_DEMAND}) fits within ${USABLE} usable."
+        fi
+    else
+        warn "Could not read max_connections; verify it exceeds ${PEAK_DEMAND}."
+    fi
+else
+    info "Verify Postgres max_connections exceeds ${PEAK_DEMAND} before launch."
 fi
 
 AVAILABLE_KB="$(df -Pk . | awk 'NR==2 {print $4}')"

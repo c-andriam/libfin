@@ -32,6 +32,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BLUE=$'\033[0;34m'; OFF=$'\033[0m'
 
 LOCAL_CHAIN=0
+LOCAL_CHAIN_ENV=""
 [[ "${1:-}" == "--local-chain" ]] && LOCAL_CHAIN=1
 
 WALLET_FILE="${WALLET_FILE:-testnet-wallet.json}"
@@ -55,6 +56,9 @@ HTTPS_PORT="${HTTPS_PORT:-8444}"
 COMPOSE=(podman-compose -f podman-compose.prod.yml -f podman-compose.prodtest.yml)
 if (( LOCAL_CHAIN )); then
     COMPOSE+=(-f podman-compose.prodtest-localchain.yml)
+    # Production mode refuses a local chain, correctly. The rehearsal says so
+    # explicitly rather than weakening the check; preflight refuses this flag.
+    LOCAL_CHAIN_ENV="ALLOW_SIMULATED_CHAIN=true"
     RPC_URL="http://gateway-anvil:8545"
     CHAIN_ID=31337
     # Deterministic address of the first contract Anvil's account 0 deploys.
@@ -234,6 +238,7 @@ ENVIRONMENT=production
 # which is a simulator because no public ISO 8583 test host exists. Preflight
 # refuses this flag, so it cannot follow the config into a real launch.
 ALLOW_SIMULATED_ACQUIRER=true
+${LOCAL_CHAIN_ENV:-}
 
 POSTGRES_PASSWORD=${PG_PASSWORD}
 REDIS_PASSWORD=${REDIS_PASSWORD}
@@ -260,6 +265,14 @@ BANK_TIMEOUT_SEC=10
 BANK_ECHO_INTERVAL_SEC=60
 ACQUIRER_TERMINAL_ID=PRODTST1
 ACQUIRER_MERCHANT_ID=PRODTEST00000001
+ACQUIRER_INSTITUTION_ID=12345678901
+ACQUIRER_NAME=PRODTEST GATEWAY
+ACQUIRER_CITY=PARIS
+ACQUIRER_STATE=
+ACQUIRER_COUNTRY_ALPHA=FR
+ACQUIRER_MERCHANT_CATEGORY=6051
+ACQUIRER_POS_CONDITION=59
+ACQUIRER_DIALECT=iso87
 ACQUIRER_CURRENCY=840
 ACQUIRER_POS_DATA=810101Y00000
 ACQUIRER_PROCESSING_CODE=000000
@@ -273,6 +286,21 @@ WEB3_RECEIPT_TIMEOUT_SEC=300
 WEB3_CONFIRMATION_TIMEOUT_SEC=600
 WEB3_MAX_FEE_GWEI=200
 ERC20_TOKEN_ADDRESS=${TOKEN}
+
+# Prices come from the real mainnet oracles even when settlement is elsewhere:
+# reading a feed is free and changes nothing, and it is the only way the live
+# rate path gets exercised through the whole stack rather than by a script.
+RATE_SOURCE=chainlink
+RATE_RPC_URL=https://ethereum-rpc.publicnode.com
+RATE_TOKEN_SYMBOL=USDT
+RATE_SETTLEMENT_CURRENCY=USD
+RATE_SPREAD=0.01
+RATE_MAX_MOVEMENT=0.10
+RATE_STALENESS_MARGIN=1.5
+RATE_BOUNDS=USDT/USD:0.5:1.5,EUR/USD:0.5:2.0,GBP/USD:0.5:2.5
+RATE_CROSS_CHECK_SOURCE=coingecko
+RATE_CROSS_CHECK_TOLERANCE=0.02
+RATE_CACHE_SECONDS=30
 EXCHANGE_RATE=1.0
 WEB3_PRIVATE_KEY=
 
@@ -392,6 +420,24 @@ say "Applying the schema"
 
 say "Starting the application"
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
+
+# Bringing the full stack up recreates the Vault container, and a production
+# Vault comes back sealed every time — by design, and the reason the runbook
+# has an unseal step after any restart. Unsealing here rather than earlier
+# because an unseal before this point would simply be undone.
+for _ in {1..20}; do
+    [[ "$(podman inspect gateway-vault-prod --format '{{.State.Status}}' 2>/dev/null)" == "running" ]] && break
+    sleep 2
+done
+if podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
+        vault status 2>/dev/null | grep -q "Sealed.*true"; then
+    podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
+        vault operator unseal "${UNSEAL_KEY}" >/dev/null 2>&1
+    ok "Vault unsealed again after the restart"
+    # The API caches "can this gateway sign?" for half a minute, so a restart
+    # here is faster than waiting for the cache to expire.
+    podman restart gateway-api-prod >/dev/null 2>&1
+fi
 for _ in {1..40}; do
     [[ "$(podman inspect gateway-api-prod --format '{{.State.Health.Status}}' 2>/dev/null)" == "healthy" ]] && break
     sleep 3
@@ -408,7 +454,7 @@ RESPONSE="$(curl -sk -X POST "https://localhost:${HTTPS_PORT}/pay" \
     -H "X-API-Key: ${API_KEY}" \
     -H "Idempotency-Key: prodtest-$(date +%s)" \
     -d "{\"pan\":\"4111111111111111\",\"expiry\":\"3012\",\"cvv\":\"123\",
-         \"amount\":\"1.00\",\"target_wallet\":\"${ADDRESS}\"}")"
+         \"amount\":\"1.00\",\"currency\":\"USD\",\"target_wallet\":\"${ADDRESS}\"}")"
 echo "  ${RESPONSE}"
 
 TX_ID="$(echo "${RESPONSE}" | python3 -c "import json,sys;print(json.load(sys.stdin).get('transaction_id',''))" 2>/dev/null)"

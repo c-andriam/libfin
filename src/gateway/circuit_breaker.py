@@ -13,9 +13,9 @@ import time
 from enum import Enum
 from typing import Optional
 
-import redis
 
 from gateway.config import settings
+from gateway.redis_client import sync_client
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,12 +71,10 @@ class Web3CircuitBreaker:
             settings.circuit_breaker_fail_closed if fail_closed is None else fail_closed
         )
         # Short timeouts: the breaker sits on the request path and must never be
-        # the thing that makes the request hang.
-        self.redis = redis.from_url(
-            redis_url or settings.redis_url,
-            socket_timeout=2,
-            socket_connect_timeout=2,
-        )
+        # the thing that makes the request hang. Health checks and retries come
+        # from the shared factory, so a Redis restart does not leave the breaker
+        # permanently unreadable — which, fail-closed, would refuse every payment.
+        self.redis = sync_client(redis_url, socket_timeout=2, socket_connect_timeout=2)
         self._record_failure = self.redis.register_script(_RECORD_FAILURE_LUA)
         # Counters live slightly longer than the recovery window so a burst of
         # unrelated failures spread over hours never adds up to an open circuit.

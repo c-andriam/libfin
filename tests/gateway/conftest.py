@@ -77,6 +77,26 @@ def clean_redis():
     fakeredis.FakeRedis(server=_fake_server).flushall()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def clean_outbox():
+    """Empty the outbox before each test.
+
+    The suite shares one in-memory database, so rows written by an earlier test
+    would otherwise be counted by a later one — and an assertion like "a
+    declined card queues nothing" would fail on someone else's message.
+    """
+    from sqlalchemy import delete
+
+    from gateway.database import async_session, init_db
+    from gateway.models import OutboxMessage
+
+    await init_db()
+    async with async_session() as session:
+        await session.execute(delete(OutboxMessage))
+        await session.commit()
+    yield
+
+
 @pytest_asyncio.fixture
 async def bank_server():
     """Run the mock acquirer for the duration of a test."""

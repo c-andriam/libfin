@@ -66,7 +66,7 @@ async def reconcile(act: bool = True) -> List[str]:
                         f"for {tx.crypto_tx_hash}."
                     )
                     if act:
-                        tx.status = TransactionStatus.CRYPTO_FAILED
+                        tx.transition_to(TransactionStatus.CRYPTO_FAILED)
                         tx.error_message = f"Reconciliation: chain reports {status}."
                         await session.commit()
                         _queue_reversal(tx.id)
@@ -85,7 +85,14 @@ async def reconcile(act: bool = True) -> List[str]:
             stale = (
                 await session.execute(
                     select(Transaction).where(
-                        Transaction.status == TransactionStatus.FIAT_APPROVED,
+                        Transaction.status.in_(
+                            [
+                                TransactionStatus.FIAT_APPROVED,
+                                # A hold with nothing delivered against it is
+                                # the same problem, and expires if ignored.
+                                TransactionStatus.FIAT_AUTHORIZED,
+                            ]
+                        ),
                         Transaction.created_at < cutoff,
                     )
                 )

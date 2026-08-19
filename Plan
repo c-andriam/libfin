@@ -360,6 +360,125 @@ Ce qui reste non validé, et ne peut pas l'être ici : le dialecte d'un
 acquéreur réel. DE22, sous-élément DE48 du CVV2, disposition DE90, format
 DE37, format du bitmap. Certification obligatoire.
 
+
+============================================================================
+Phase 10 : Outbox transactionnelle + défauts de nonce  [2026-08-18]
+============================================================================
+[x] Outbox transactionnelle — src/gateway/outbox.py
+    L'intention de tâche est écrite dans la MÊME transaction SQL que le
+    paiement. Publier devient une étape séparée et réessayable lisant un
+    enregistrement durable. Avant : commit puis apply_async, et un processus qui
+    mourait entre les deux laissait une carte autorisée sans rien en file.
+    Marquée publiée seulement après acceptation du broker : au-moins-une-fois,
+    jamais au-plus-une-fois. Les deux tâches étant idempotentes, le doublon
+    coûte moins cher que la perte.
+    Relais planifié toutes les 30 s + purge des messages livrés.
+
+[x] Défaut : TimeExhausted n'hérite pas de TimeoutError
+    web3 signale une attente épuisée avec TimeExhausted (Web3Exception). Toute
+    la logique de remplacement de transaction coincée reposait sur
+    `except TimeoutError` — elle était INATTEIGNABLE et n'avait jamais tourné.
+    Normalisé à la source dans await_confirmation. Un test verrouille la
+    prémisse pour qu'une montée de version ne la réinvalide pas.
+
+[x] Défaut : trou de nonce — gel permanent du portefeuille chaud
+    Une transaction signée au nonce N ne peut jamais être minée si un nonce
+    inférieur n'a jamais été diffusé. Observé : chaîne à 508, transaction à 509,
+    tous les paiements suivants empilés derrière. Rien ne le détectait.
+    Ajout de nonce_gap() et fill_nonce_gap() — comblement par transactions à
+    zéro vers soi-même, borné à 10 (au-delà, la comptabilité est fausse).
+    Vérifié : transaction bloquée depuis des heures passée en CRYPTO_SENT.
+
+[x] Défaut : le remplacement n'escaladait pas les frais
+    Chaque tentative recalculait contre le même marché → transaction identique
+    → « transaction already imported ». Le compteur montait, rien ne bougeait.
+    Multiplicateur désormais composé par tentative.
+
+[x] Suite de chaos : 6/6 sur le nouveau flux
+    bank-down · chain-down · insufficient-funds · reversal-refused
+    worker-killed · redis-down
+    worker-killed finit maintenant en CRYPTO_SENT (459 s) : le client est servi
+    malgré la mort du worker en plein transfert, au lieu d'être seulement
+    remboursé.
+
+[x] Résultats de validation conservés dans .validation/ du dépôt, plus dans
+    /tmp — une session précédente avait perdu un verdict au redémarrage.
+
+Constat de méthode : cinq défauts de chemin d'argent trouvés ce jour, dont
+trois d'affilée dans du code de SECOURS. Le code qui ne s'exécute qu'en cas
+d'échec est celui qui n'a jamais tourné. Seuls les scénarios de panne les
+exposent — aucun test unitaire ne le pouvait, ils mockaient la couche concernée.
+
+
+============================================================================
+Phase 11 : Vérification contre références externes  [2026-08-19]
+============================================================================
+Méthode : confronter chaque hypothèse à une source publiée, plutôt que la
+relire. Sources — packagers jPOS (base1, visapack, europay, iso87, base24),
+table ISO 8583:1987, et surtout le guide de référence ISO 8583 de Worldpay,
+publié en accès libre (460 pages), que j'avais affirmé inexistant.
+
+DIALECTE ISO 8583
+[x] DE12 : n12 date+heure → n6 heure seule (4/4 sources concordantes)
+[x] DE13 : ajouté, n4 date locale — était absent
+[x] DE22 : 12 caractères → n3 ou n4 selon dialecte
+[x] DE7  : ajouté, n10, OBLIGATOIRE — et DE90.3 cite sa valeur, donc les
+    reversals référençaient un champ jamais émis
+[x] DE18 : ajouté, code d'activité commerçant, obligatoire
+[x] DE32, DE43 : câblés, obligatoires
+[x] DE25 : ajouté, 59 = commerce électronique. Pilote l'interchange et la
+    responsabilité en cas d'impayé.
+[x] DE22 par défaut : 01 (saisie manuelle sur terminal) → 09 (commerce
+    électronique). Deux types de transaction différents.
+[x] DE43 construit positionnellement (1-23 nom, 24-36 ville, 39-40 pays)
+    au lieu d'une chaîne libre où un décalage met la ville dans le nom.
+[x] Trois profils de dialecte, chacun nommant sa source. Test refusant tout
+    profil sans référence déclarée.
+
+CODES RÉPONSE (DE39)
+[x] CRITIQUE : success = code in ("00","12","21") — or 12 = « Invalid
+    Transaction » et 21 = « Reversal Unsuccessful », deux REFUS.
+    Un remboursement refusé était enregistré comme réussi : client jamais
+    remboursé, aucune alerte, aucune trace.
+    Corrigé : is_reversal_approved n'accepte que 00, et la propriété
+    REVERSAL_APPROVAL_CODES < APPROVAL_CODES est testée.
+[x] Codes de configuration (03, 30) distingués des refus émetteur : ils
+    échouent TOUTES les transactions, pas une seule.
+
+TYPES DE MESSAGE
+[x] Capture : 0220 → 0120. La table de flux Worldpay donne
+    0100/0110 → 0120/0130 → 0420/0430 pour la préautorisation.
+[x] Reversal : 0400 → 0420. Un 0400 est une requête refusable, un 0420 un
+    avis enregistré. Pour défaire une transaction jamais aboutie, l'avis est
+    la bonne sémantique.
+
+AUDIT MÉCANIQUE (six défauts, zéro par relecture)
+[x] CRITIQUE : countdown 3600s contre visibility_timeout 900s → chaque
+    message redélivré avant son ETA, puis redélivré à son tour.
+    65 073 tâches en file, paiements réels affamés derrière.
+    Défaut introduit par MOI en « corrigeant » ce délai la veille : j'avais
+    raisonné sur la durée d'exécution, jamais sur la replanification.
+[x] CRITIQUE : double capture. Capture réussie chez l'acquéreur, processus
+    mort avant l'écriture, réessai qui capture à nouveau. STAN désormais
+    persisté AVANT l'envoi — même discipline que le hash côté chaîne, que
+    j'avais sous les yeux et n'avais pas appliquée côté fiat.
+[x] Blocage indéfini : writer.drain() sans borne. Un acquéreur qui accepte
+    puis cesse de lire immobilisait un worker Gunicorn par paiement, et le
+    délai de réponse ne démarrait jamais.
+[x] Migration ADD COLUMN NOT NULL sans server_default : passe sur base vide,
+    échoue sur base peuplée — le pire endroit pour le découvrir.
+[x] ABI USDT : transfer ne renvoie rien (vérifié sur mainnet, retour 0x).
+    Latent, mais armé pour quiconque ajoute une vérification à blanc.
+[x] Capacité base : 93 connexions de pointe, jamais comparées au
+    max_connections réel. Contrôle ajouté au preflight.
+
+[x] 427 tests, 6/6 scénarios de chaos sur la version corrigée.
+
+Constat : zéro défaut trouvé par relecture, six par questions mécaniques
+(motif « écriture → appel externe », attente sans borne, délai contre délai,
+calcul de capacité) et sept par confrontation externe. Sur ce code, la
+relecture ne produit pas ; l'interrogation systématique produit.
+
 ============================================================================
 Reste à faire — non-code, côté humain
 ============================================================================

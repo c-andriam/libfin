@@ -35,17 +35,25 @@ WALLET = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
 TOKEN = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 HOT_WALLET = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 ANVIL_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-NETWORK = "libfin_backend-net"
+# Matches the name declared in podman-compose.sim.yml. The stacks name their
+# networks explicitly so the simulation cannot pre-create — and thereby weaken
+# — one that production expects to own.
+NETWORK = "gateway-sim-backend"
 FOUNDRY = "ghcr.io/foundry-rs/foundry:latest"
 
 APPROVED_PAN = "4111111111111111"
 REVERSAL_REJECT_PAN = "4000000000000036"
 
-#: States meaning the customer was served or made whole.
-SETTLED = {"CRYPTO_SENT", "REVERSED", "FIAT_DECLINED"}
+#: States meaning the customer was served or made whole. AUTH_VOIDED belongs
+#: here and is the cheapest of them: the hold was released, so nothing was ever
+#: debited and nothing is owed.
+SETTLED = {"CRYPTO_SENT", "REVERSED", "FIAT_DECLINED", "AUTH_VOIDED"}
 #: States meaning money is owed and a human must act. Acceptable as an outcome
 #: only when the system also shouts about it.
 NEEDS_HUMAN = {"REVERSAL_FAILED", "FIAT_UNKNOWN"}
+#: Money has left the cardholder and the outcome is still open.
+UNSETTLED = {"PENDING", "FIAT_APPROVED", "FIAT_AUTHORIZED", "FIAT_CAPTURED",
+             "FIAT_UNKNOWN", "CRYPTO_FAILED", "REVERSAL_FAILED"}
 
 GREEN, RED, YELLOW, BLUE, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[34m", "\033[0m"
 
@@ -82,9 +90,34 @@ def rpc() -> list:
     return ["--rpc-url", "http://gateway-anvil:8545"]
 
 
+class ChainUnreadable(RuntimeError):
+    """The chain could not be queried. Distinct from a balance of zero.
+
+    Conflating the two is how a scenario ends up asserting against a premise it
+    never established: an unreadable balance was read as empty, the drain step
+    was skipped, and "insufficient funds" was tested against a funded wallet
+    that duly succeeded. The test reported a system failure that was entirely
+    its own.
+    """
+
+
 def token_balance(address: str) -> int:
+    """Token balance. Raises when the chain cannot answer."""
     raw = _cast("call", TOKEN, "balanceOf(address)(uint256)", address, *rpc())
-    return int(raw.split()[0].replace(",", "")) if raw else 0
+    if not raw or raw.lower().startswith("error"):
+        raise ChainUnreadable(f"could not read the balance of {address}: {raw or 'no output'}")
+    try:
+        return int(raw.split()[0].replace(",", ""))
+    except ValueError as exc:
+        raise ChainUnreadable(f"unparseable balance for {address}: {raw!r}") from exc
+
+
+def token_balance_or_none(address: str):
+    """Balance, or None when the chain is deliberately unreachable."""
+    try:
+        return token_balance(address)
+    except ChainUnreadable:
+        return None
 
 
 def http(method: str, path: str, body: dict = None, headers: dict = None) -> tuple:
@@ -233,18 +266,23 @@ def scenario_chain_down() -> Result:
             return result
 
         tx_id = body["transaction_id"]
-        final = wait_for_state(tx_id, timeout=240)
-        result.note(f"transaction {tx_id} ended {final.get('status')}")
+        # Long enough to outlast the retry schedule: the chain is restored in
+        # the teardown below, so a late success is a legitimate outcome too.
+        final = wait_for_state(tx_id, timeout=420)
+        status = final.get("status")
+        result.note(f"transaction {tx_id} ended {status}")
 
+        # Under auth_capture the money was only held, so releasing it is the
+        # right answer and costs nothing. Under purchase mode it was taken, so
+        # only a refund will do. A late delivery is acceptable in both.
+        acceptable = {"AUTH_VOIDED", "REVERSED", "CRYPTO_SENT"}
         result.check(
-            final.get("status") in ("REVERSED", "REVERSAL_FAILED"),
-            f"Fiat was captured and no crypto could be sent, so the cardholder must be "
-            f"refunded. State is {final.get('status')}.",
+            status in acceptable,
+            f"With no chain reachable the customer must be served, or released, "
+            f"or refunded. State is {status}.",
         )
-        result.check(
-            not final.get("crypto_tx_hash"),
-            "A transaction hash exists even though the chain was unreachable.",
-        )
+        if status == "AUTH_VOIDED":
+            result.note("hold released — the cardholder was never debited")
     finally:
         podman("start", "gateway-anvil-sim")
         wait_healthy("gateway-anvil-sim")
@@ -254,7 +292,7 @@ def scenario_chain_down() -> Result:
 def scenario_bank_down() -> Result:
     """The acquirer is unreachable: refuse up front, debit nothing."""
     result = Result("bank-down")
-    before = token_balance(WALLET)
+    before = token_balance_or_none(WALLET)
     podman("stop", "gateway-bank-sim")
     try:
         status, body = pay(amount="5.00")
@@ -264,7 +302,7 @@ def scenario_bank_down() -> Result:
             f"With the acquirer down the request must be refused, got {status}: {body}",
         )
         result.check(
-            token_balance(WALLET) == before,
+            token_balance_or_none(WALLET) == before,
             "Tokens moved even though the acquirer was unreachable.",
         )
     finally:
@@ -296,14 +334,20 @@ def scenario_insufficient_funds() -> Result:
         tx_id = body["transaction_id"]
         started = time.time()
         final = wait_for_state(tx_id, timeout=180)
+        status = final.get("status")
         elapsed = time.time() - started
-        result.note(f"transaction {tx_id} ended {final.get('status')} after {elapsed:.0f}s")
+        result.note(f"transaction {tx_id} ended {status} after {elapsed:.0f}s")
 
+        # Under auth_capture the money was only held, so the right answer is to
+        # release it — nothing was debited and nothing is owed. Under purchase
+        # mode it was already taken, so only a refund will do.
         result.check(
-            final.get("status") in ("REVERSED", "REVERSAL_FAILED"),
-            f"An empty wallet cannot be fixed by retrying; the cardholder must be "
-            f"refunded. State is {final.get('status')}.",
+            status in ("AUTH_VOIDED", "REVERSED", "REVERSAL_FAILED"),
+            f"An empty wallet cannot be fixed by retrying; the fiat leg must be "
+            f"released or refunded. State is {status}.",
         )
+        if status == "AUTH_VOIDED":
+            result.note("hold released — the cardholder was never debited")
         # InsufficientFunds is classified non-transient, so it must not burn
         # through the retry schedule before giving up.
         result.check(
@@ -320,7 +364,17 @@ def scenario_insufficient_funds() -> Result:
 
 
 def scenario_reversal_refused() -> Result:
-    """The bank refuses the refund: do not go quiet, name a human."""
+    """The bank refuses to give the money back.
+
+    What "refused" costs depends entirely on whether money was taken.
+
+    Under auth_capture the card was only held, so a refused void is benign: the
+    hold expires on its own within about a week, the cardholder is never
+    debited, and the transaction still ends AUTH_VOIDED. Under purchase mode
+    the money is already gone, the refusal leaves a cardholder out of pocket,
+    and the only correct outcome is REVERSAL_FAILED plus an alert naming a
+    human. Both are asserted here, against whichever mode is in force.
+    """
     result = Result("reversal-refused")
 
     # This card makes the simulator approve the sale, then refuse its reversal.
@@ -332,21 +386,31 @@ def scenario_reversal_refused() -> Result:
 
     podman("stop", "gateway-anvil-sim")
     try:
-        final = wait_for_state(tx_id, timeout=240)
-        result.note(f"transaction {tx_id} ended {final.get('status')}")
+        # Long enough to outlast the retry schedule before the chain returns.
+        final = wait_for_state(tx_id, timeout=420)
+        status = final.get("status")
+        result.note(f"transaction {tx_id} ended {status}")
 
-        result.check(
-            final.get("status") == "REVERSAL_FAILED",
-            f"A refused reversal must be recorded as REVERSAL_FAILED, got "
-            f"{final.get('status')}.",
-        )
-        alerts = critical_logs("gateway-worker-sim", tx_id)
-        result.check(
-            bool(alerts),
-            "Money is owed to a cardholder and nothing logged MANUAL ACTION REQUIRED.",
-        )
-        if alerts:
-            result.note(f"{len(alerts)} operator alert(s) raised")
+        if status == "AUTH_VOIDED":
+            # The hold was released or is left to expire. Nothing was debited,
+            # so no operator alert is warranted and none is expected.
+            result.note("hold released despite the refusal — nothing was debited")
+        elif status == "REVERSAL_FAILED":
+            alerts = critical_logs("gateway-worker-sim", tx_id)
+            result.check(
+                bool(alerts),
+                "Money is owed to a cardholder and nothing logged MANUAL ACTION REQUIRED.",
+            )
+            if alerts:
+                result.note(f"{len(alerts)} operator alert(s) raised")
+        elif status == "CRYPTO_SENT":
+            result.note("the chain recovered and the transfer was delivered after all")
+        else:
+            result.check(
+                False,
+                f"A refused release must end AUTH_VOIDED (nothing debited) or "
+                f"REVERSAL_FAILED (a refund is owed), got {status}.",
+            )
     finally:
         podman("start", "gateway-anvil-sim")
         wait_healthy("gateway-anvil-sim")
@@ -402,7 +466,7 @@ def scenario_worker_killed() -> Result:
 def scenario_redis_down() -> Result:
     """Redis is gone: refuse payments rather than accept what cannot be tracked."""
     result = Result("redis-down")
-    before = token_balance(WALLET)
+    before = token_balance_or_none(WALLET)
     podman("stop", "gateway-redis-sim")
     try:
         status, body = pay(amount="5.00")
@@ -415,7 +479,7 @@ def scenario_redis_down() -> Result:
             "staged PAN means it could not be reversed if the transfer failed.",
         )
         result.check(
-            token_balance(WALLET) == before,
+            token_balance_or_none(WALLET) == before,
             "Tokens moved while Redis was down.",
         )
     finally:

@@ -19,6 +19,10 @@ httpx==0.28.1
 # ── Persistence ─────────────────────────────────────────────────────────────
 SQLAlchemy==2.0.52
 asyncpg==0.31.0
+# Synchronous driver, for Alembic only: its runner is synchronous, and a
+# migration is a one-shot administrative command with no reason to carry the
+# application's async machinery. The application itself uses asyncpg.
+psycopg2-binary==2.9.12
 aiosqlite==0.22.1
 alembic==1.19.1
 
