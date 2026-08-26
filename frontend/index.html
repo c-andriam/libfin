@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Aucune donnée de carte ne doit fuir vers un tiers : pas de CDN, pas de police
+       distante, pas de télémétrie. Tout est servi depuis cette origine. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src *; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — Passerelle de paiement</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark" aria-hidden="true">◈</span>
+    <span>libfin<span class="topbar__sub"> · passerelle 2D</span></span>
+  </div>
+  <div class="topbar__right">
+    <span id="health" class="pill pill--idle" title="État de la passerelle">
+      <span class="pill__dot"></span><span id="health-label">non vérifié</span>
+    </span>
+    <button type="button" id="settings-toggle" class="btn btn--ghost" aria-expanded="false"
+            aria-controls="settings">Connexion</button>
+  </div>
+</header>
+
+<!-- ── Connexion à la passerelle ─────────────────────────────────────────── -->
+<section id="settings" class="settings" hidden>
+  <div class="settings__inner">
+    <div class="field">
+      <label for="base-url">URL de la passerelle</label>
+      <input type="url" id="base-url" placeholder="https://localhost:8443" autocomplete="off" spellcheck="false">
+      <p class="hint">Doit figurer dans <code>CORS_ORIGINS</code> côté passerelle.</p>
+    </div>
+    <div class="field">
+      <label for="api-key">Clé d'API <span class="tag tag--warn">dev</span></label>
+      <input type="password" id="api-key" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
+      <p class="hint">Conservée en <code>sessionStorage</code>, effacée à la fermeture de l'onglet.
+         Une clé d'API dans un navigateur est acceptable en simulation, jamais en production.</p>
+    </div>
+    <div class="settings__actions">
+      <button type="button" id="health-check" class="btn btn--ghost">Tester la connexion</button>
+    </div>
+  </div>
+</section>
+
+<main class="layout">
+
+  <!-- ── Formulaire ─────────────────────────────────────────────────────── -->
+  <form id="payment-form" class="panel" novalidate autocomplete="off">
+    <h1 class="panel__title">Paiement par carte</h1>
+    <p class="panel__lede">Le débit fiat est autorisé de façon synchrone ; la remise crypto suit.</p>
+
+    <div class="field">
+      <label for="pan">Numéro de carte</label>
+      <div class="input-wrap">
+        <input type="text" id="pan" name="pan" inputmode="numeric" autocomplete="off"
+               placeholder="4111 1111 1111 1111" maxlength="23"
+               aria-describedby="pan-error" spellcheck="false">
+        <span id="brand" class="brand" aria-live="polite"></span>
+      </div>
+      <p class="error" id="pan-error" role="alert"></p>
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <label for="expiry">Date d'expiration</label>
+        <input type="text" id="expiry" name="expiry" inputmode="numeric" autocomplete="off"
+               placeholder="MM/AA" maxlength="5" aria-describedby="expiry-error" spellcheck="false">
+        <p class="error" id="expiry-error" role="alert"></p>
+      </div>
+      <div class="field">
+        <label for="cvv">CVV</label>
+        <input type="password" id="cvv" name="cvv" inputmode="numeric" autocomplete="off"
+               placeholder="123" maxlength="4" aria-describedby="cvv-error" spellcheck="false">
+        <p class="error" id="cvv-error" role="alert"></p>
+      </div>
+    </div>
+
+    <hr class="rule">
+
+    <div class="row">
+      <div class="field">
+        <label for="amount">Montant</label>
+        <input type="text" id="amount" name="amount" inputmode="decimal" autocomplete="off"
+               placeholder="25.00" aria-describedby="amount-error" spellcheck="false">
+        <p class="error" id="amount-error" role="alert"></p>
+      </div>
+      <div class="field field--narrow">
+        <label for="currency">Devise</label>
+        <select id="currency" name="currency">
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="target-wallet">Portefeuille destinataire</label>
+      <input type="text" id="target-wallet" name="target_wallet" autocomplete="off"
+             placeholder="0x0000000000000000000000000000000000000000" maxlength="42"
+             aria-describedby="wallet-error" spellcheck="false">
+      <p class="error" id="wallet-error" role="alert"></p>
+    </div>
+
+    <button type="submit" id="submit" class="btn btn--primary">
+      <span class="btn__label">Payer</span>
+      <span class="spinner" aria-hidden="true"></span>
+    </button>
+
+    <p class="disclaimer">
+      Les données de carte ne sont ni journalisées ni stockées par cette page ;
+      elles sont transmises à la passerelle puis effacées du formulaire.
+    </p>
+  </form>
+
+  <!-- ── Résultat ───────────────────────────────────────────────────────── -->
+  <section class="panel panel--result" id="result" aria-live="polite">
+    <div class="empty" id="result-empty">
+      <span class="empty__mark" aria-hidden="true">◇</span>
+      <p>Aucune transaction pour l'instant.</p>
+    </div>
+
+    <div id="result-body" hidden>
+      <div class="status" id="status">
+        <span class="status__dot"></span>
+        <div>
+          <p class="status__label" id="status-label"></p>
+          <p class="status__message" id="status-message"></p>
+        </div>
+      </div>
+      <dl class="details" id="details"></dl>
+    </div>
+  </section>
+
+</main>
+
+<script src="assets/js/card.js"></script>
+<script src="assets/js/api.js"></script>
+<script src="assets/js/ui.js"></script>
+<script src="assets/js/main.js"></script>
+</body>
+</html>
