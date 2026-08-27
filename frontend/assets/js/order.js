@@ -20,6 +20,18 @@ const Order = (() => {
   const KEY = 'libfin.order';
   const CURRENCIES = ['USD', 'EUR', 'GBP'];
 
+  //: ISO 4217 a deux écritures et la passerelle utilise les deux : « USD » dans
+  //: la requête, « 840 » dans ce qu'elle stocke et renvoie (DE49 est numérique).
+  //: Sans cette table, la page de confirmation affiche « Devise : 840 ».
+  const NUMERIC = { 840: 'USD', 978: 'EUR', 826: 'GBP', 392: 'JPY' };
+
+  /** Le code alphabétique, quelle que soit l'écriture reçue. */
+  function currencyLabel(value) {
+    const raw = String(value === undefined || value === null ? '' : value).trim();
+    if (/^\d{3}$/.test(raw)) return NUMERIC[Number(raw)] || raw;
+    return raw.toUpperCase();
+  }
+
   /** Enregistre la commande. Renvoie faux si le navigateur refuse le stockage. */
   function save(order) {
     try {
@@ -102,7 +114,10 @@ const Order = (() => {
   /** Montant tel qu'on l'affiche : « 25.00 USD ». */
   const format = (order) => `${order.amount} ${order.currency}`;
 
-  return { save, load, clear, fromQuery, toQuery, validate, isValid, format, CURRENCIES, KEY };
+  return {
+    save, load, clear, fromQuery, toQuery, validate, isValid, format,
+    currencyLabel, CURRENCIES, NUMERIC, KEY,
+  };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = Order;

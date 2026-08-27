@@ -154,7 +154,9 @@ const UI = (() => {
       const dt = document.createElement('dt');
       dt.textContent = label;
       const dd = document.createElement('dd');
-      dd.textContent = DATE_FIELDS.has(key) ? formatDate(value) : String(value);
+      if (DATE_FIELDS.has(key)) dd.textContent = formatDate(value);
+      else if (key === 'currency') dd.textContent = Order.currencyLabel(value);
+      else dd.textContent = String(value);
       if (DATE_FIELDS.has(key)) dd.classList.add('details__date');
       row.append(dt, dd);
       list.append(row);

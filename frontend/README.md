@@ -354,6 +354,31 @@ GATEWAY_API_KEY=simulation-api-key-not-a-secret \
 `--insecure` désactive la vérification TLS : réservé au certificat auto-signé
 de la simulation.
 
+### Avec la vraie passerelle, sans conteneurs
+
+`make sim` est la voie fidèle, mais elle demande Podman. Sur un poste nu,
+[run_gateway_local.py](../scripts/run_gateway_local.py) lance **la vraie
+application FastAPI** contre SQLite et un Redis en mémoire :
+
+```bash
+pip install -e '.[gateway,test]'
+
+python tests/simulator/bank_server.py                 # l'acquéreur simulé
+python scripts/run_gateway_local.py --port 8100       # la passerelle réelle
+
+GATEWAY_API_KEY=simulation-api-key-not-a-secret \
+  python frontend/serve.py --gateway http://127.0.0.1:8100
+```
+
+Sont alors **réels** : l'application et ses middlewares, la validation Pydantic,
+l'encodage ISO 8583 de libfin, le dialogue TCP avec l'acquéreur, la base et la
+machine à états.
+
+Sont **simulés** : le stockage (SQLite), Redis, l'acquéreur — et il n'y a
+**aucune chaîne**, donc les paiements s'arrêtent à `FIAT_AUTHORIZED`. Le
+règlement crypto demande `make sim`, qui monte une chaîne locale et un worker
+Celery.
+
 ### Cartes de test
 
 Scénarios câblés dans l'acquéreur simulé
