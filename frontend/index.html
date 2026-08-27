@@ -8,7 +8,7 @@
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src *; img-src 'self' data:; form-action 'none'; base-uri 'none'">
   <meta name="referrer" content="no-referrer">
-  <title>libfin — Passerelle de paiement</title>
+  <title>libfin — Votre commande</title>
   <link rel="stylesheet" href="assets/css/styles.css">
 </head>
 <body>
@@ -27,7 +27,6 @@
   </div>
 </header>
 
-<!-- ── Connexion à la passerelle ─────────────────────────────────────────── -->
 <section id="settings" class="settings" hidden>
   <div class="settings__inner">
     <div class="field">
@@ -38,8 +37,7 @@
     <div class="field">
       <label for="api-key">Clé d'API <span class="tag tag--warn">dev</span></label>
       <input type="password" id="api-key" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
-      <p class="hint">Conservée en <code>sessionStorage</code>, effacée à la fermeture de l'onglet.
-         Une clé d'API dans un navigateur est acceptable en simulation, jamais en production.</p>
+      <p class="hint">Conservée en <code>sessionStorage</code>, effacée à la fermeture de l'onglet.</p>
     </div>
     <div class="settings__actions">
       <button type="button" id="health-check" class="btn btn--ghost">Tester la connexion</button>
@@ -47,51 +45,29 @@
   </div>
 </section>
 
-<main class="layout">
+<main class="layout layout--single">
+  <ol class="steps" aria-label="Étapes du paiement">
+    <li class="steps__item is-current" aria-current="step"><span class="steps__num">1</span>Commande</li>
+    <li class="steps__item"><span class="steps__num">2</span>Paiement</li>
+    <li class="steps__item"><span class="steps__num">3</span>Confirmation</li>
+  </ol>
 
-  <!-- ── Formulaire ─────────────────────────────────────────────────────── -->
-  <form id="payment-form" class="panel" novalidate autocomplete="off">
-    <h1 class="panel__title">Paiement par carte</h1>
-    <p class="panel__lede">Le débit fiat est autorisé de façon synchrone ; la remise crypto suit.</p>
+  <form id="order-form" class="panel" novalidate autocomplete="off">
+    <h1 class="panel__title">Votre commande</h1>
+    <p class="panel__lede">Indiquez le montant à convertir et l'adresse qui recevra la crypto.</p>
 
-    <div class="field">
-      <label for="pan">Numéro de carte</label>
-      <div class="input-wrap">
-        <input type="text" id="pan" name="pan" inputmode="numeric" autocomplete="off"
-               placeholder="4111 1111 1111 1111" maxlength="23"
-               aria-describedby="pan-error" spellcheck="false">
-        <span id="brand" class="brand" aria-live="polite"></span>
-      </div>
-      <p class="error" id="pan-error" role="alert"></p>
-    </div>
+    <p class="banner" id="form-error" role="alert" hidden></p>
 
-    <div class="row">
-      <div class="field">
-        <label for="expiry">Date d'expiration</label>
-        <input type="text" id="expiry" name="expiry" inputmode="numeric" autocomplete="off"
-               placeholder="MM/AA" maxlength="5" aria-describedby="expiry-error" spellcheck="false">
-        <p class="error" id="expiry-error" role="alert"></p>
-      </div>
-      <div class="field">
-        <label for="cvv">CVV</label>
-        <input type="password" id="cvv" name="cvv" inputmode="numeric" autocomplete="off"
-               placeholder="123" maxlength="4" aria-describedby="cvv-error" spellcheck="false">
-        <p class="error" id="cvv-error" role="alert"></p>
-      </div>
-    </div>
-
-    <hr class="rule">
-
-    <div class="row">
+    <div class="row row--amount">
       <div class="field">
         <label for="amount">Montant</label>
-        <input type="text" id="amount" name="amount" inputmode="decimal" autocomplete="off"
+        <input type="text" id="amount" inputmode="decimal" autocomplete="off"
                placeholder="25.00" aria-describedby="amount-error" spellcheck="false">
         <p class="error" id="amount-error" role="alert"></p>
       </div>
       <div class="field field--narrow">
         <label for="currency">Devise</label>
-        <select id="currency" name="currency">
+        <select id="currency">
           <option value="USD">USD</option>
           <option value="EUR">EUR</option>
           <option value="GBP">GBP</option>
@@ -100,48 +76,34 @@
     </div>
 
     <div class="field">
-      <label for="target-wallet">Portefeuille destinataire</label>
-      <input type="text" id="target-wallet" name="target_wallet" autocomplete="off"
+      <label for="wallet">Adresse du portefeuille destinataire</label>
+      <input type="text" id="wallet" autocomplete="off" spellcheck="false"
              placeholder="0x0000000000000000000000000000000000000000" maxlength="42"
-             aria-describedby="wallet-error" spellcheck="false">
+             aria-describedby="wallet-error wallet-note">
       <p class="error" id="wallet-error" role="alert"></p>
+      <p class="warn" id="wallet-warn" role="status" hidden></p>
+      <p class="hint" id="wallet-note">
+        Adresse Ethereum : <code>0x</code> suivi de 40 caractères hexadécimaux.
+        La somme de contrôle EIP-55 est vérifiée quand la casse le permet.
+      </p>
     </div>
 
     <button type="submit" id="submit" class="btn btn--primary">
-      <span class="btn__label">Payer</span>
-      <span class="spinner" aria-hidden="true"></span>
+      <span class="btn__label">Continuer vers le paiement</span>
     </button>
 
     <p class="disclaimer">
-      Les données de carte ne sont ni journalisées ni stockées par cette page ;
-      elles sont transmises à la passerelle puis effacées du formulaire.
+      Aucune donnée de carte n'est demandée à cette étape.
     </p>
   </form>
-
-  <!-- ── Résultat ───────────────────────────────────────────────────────── -->
-  <section class="panel panel--result" id="result" aria-live="polite">
-    <div class="empty" id="result-empty">
-      <span class="empty__mark" aria-hidden="true">◇</span>
-      <p>Aucune transaction pour l'instant.</p>
-    </div>
-
-    <div id="result-body" hidden>
-      <div class="status" id="status">
-        <span class="status__dot"></span>
-        <div>
-          <p class="status__label" id="status-label"></p>
-          <p class="status__message" id="status-message"></p>
-        </div>
-      </div>
-      <dl class="details" id="details"></dl>
-    </div>
-  </section>
-
 </main>
 
 <script src="assets/js/card.js"></script>
+<script src="assets/js/address.js"></script>
+<script src="assets/js/order.js"></script>
 <script src="assets/js/api.js"></script>
 <script src="assets/js/ui.js"></script>
-<script src="assets/js/main.js"></script>
+<script src="assets/js/boot.js"></script>
+<script src="assets/js/order-page.js"></script>
 </body>
 </html>

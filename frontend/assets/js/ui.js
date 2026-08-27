@@ -1,9 +1,10 @@
 /**
- * Rendu : tout ce qui touche au DOM, et rien d'autre.
+ * Rendu partagé par les trois pages : tout ce qui touche au DOM, et rien d'autre.
  *
  * Aucune valeur n'est insérée par `innerHTML` — le PAN masqué, un hash de
  * transaction ou un message d'erreur venu du serveur sont du texte, jamais du
- * balisage.
+ * balisage. Les fonctions tolèrent l'absence de leur cible : chaque page ne
+ * porte qu'une partie de ces éléments.
  */
 const UI = (() => {
   'use strict';
@@ -26,86 +27,6 @@ const UI = (() => {
   };
 
   const describe = (status) => STATUS[status] || { tone: 'pending', label: status || 'Inconnu', message: '' };
-
-  /** Libellés des lignes de détail, dans l'ordre où elles s'affichent. */
-  const LABELS = {
-    transaction_id: 'Transaction',
-    id: 'Transaction',
-    fiat_amount: 'Montant',
-    amount: 'Montant',
-    currency: 'Devise',
-    masked_pan: 'Carte',
-    stan: 'STAN',
-    rrn: 'RRN',
-    target_wallet: 'Portefeuille',
-    tx_hash: 'Hash crypto',
-    crypto_tx_hash: 'Hash crypto',
-    created_at: 'Créée le',
-    completed_at: 'Terminée le',
-    error: 'Détail',
-  };
-
-  const ORDER = [
-    'transaction_id', 'id', 'fiat_amount', 'amount', 'currency', 'masked_pan',
-    'stan', 'rrn', 'target_wallet', 'tx_hash', 'crypto_tx_hash',
-    'created_at', 'completed_at', 'error',
-  ];
-
-  /** Affiche ou efface le message d'erreur attaché à un champ. */
-  function setFieldError(inputId, errorId, message) {
-    const input = $(inputId);
-    const holder = $(errorId);
-    if (holder) holder.textContent = message || '';
-    if (input) {
-      if (message) input.setAttribute('aria-invalid', 'true');
-      else input.removeAttribute('aria-invalid');
-    }
-  }
-
-  /** Bascule l'état occupé du bouton d'envoi. */
-  function setBusy(busy) {
-    const button = $('submit');
-    if (!button) return;
-    button.disabled = busy;
-    button.classList.toggle('is-busy', busy);
-    button.querySelector('.btn__label').textContent = busy ? 'Traitement…' : 'Payer';
-  }
-
-  /** Peint le bandeau d'état du panneau de résultat. */
-  function showStatus(tone, label, message) {
-    $('result-empty').hidden = true;
-    $('result-body').hidden = false;
-    const box = $('status');
-    box.className = `status status--${tone}`;
-    $('status-label').textContent = label;
-    $('status-message').textContent = message || '';
-  }
-
-  /** Reconstruit la liste de détails à partir d'un objet de réponse. */
-  function showDetails(data) {
-    const list = $('details');
-    list.textContent = '';
-    if (!data) return;
-
-    const seen = new Set();
-    ORDER.forEach((key) => {
-      const value = data[key];
-      if (value === undefined || value === null || value === '') return;
-      const label = LABELS[key];
-      // `id` et `transaction_id` désignent la même chose selon la réponse.
-      if (seen.has(label)) return;
-      seen.add(label);
-
-      const row = document.createElement('div');
-      row.className = 'details__row';
-      const dt = document.createElement('dt');
-      dt.textContent = label;
-      const dd = document.createElement('dd');
-      dd.textContent = String(value);
-      row.append(dt, dd);
-      list.append(row);
-    });
-  }
 
   /**
    * Traduit un code HTTP d'échec en tonalité et titre.
@@ -131,9 +52,120 @@ const UI = (() => {
 
   const describeHttpError = (status) => HTTP_ERRORS[status] || { tone: 'error', label: 'Échec' };
 
-  /** Pastille d'état de la passerelle dans la barre supérieure. */
+  // ── Champs ────────────────────────────────────────────────────────────────
+
+  /** Affiche ou efface le message d'erreur attaché à un champ. */
+  function setFieldError(inputId, errorId, message) {
+    const input = $(inputId);
+    const holder = $(errorId);
+    if (holder) holder.textContent = message || '';
+    if (input) {
+      if (message) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+    }
+  }
+
+  /** Avertissement non bloquant sous un champ : informe sans interdire. */
+  function setFieldWarning(warnId, message) {
+    const holder = $(warnId);
+    if (!holder) return;
+    holder.textContent = message || '';
+    holder.hidden = !message;
+  }
+
+  /** Bandeau en tête de formulaire, pour ce qui ne vise aucun champ précis. */
+  function showBanner(message, tone = 'error') {
+    const box = $('form-error');
+    if (!box) return;
+    box.textContent = message || '';
+    box.className = `banner banner--${tone}`;
+    box.hidden = !message;
+  }
+
+  const hideBanner = () => showBanner('');
+
+  /** Bascule l'état occupé d'un bouton d'envoi. */
+  function setBusy(busy, label) {
+    const button = $('submit');
+    if (!button) return;
+    button.disabled = busy;
+    button.classList.toggle('is-busy', busy);
+    const span = button.querySelector('.btn__label');
+    if (span && label) span.textContent = label;
+  }
+
+  // ── Panneau d'état (page de confirmation) ─────────────────────────────────
+
+  function showStatus(tone, label, message) {
+    const box = $('status');
+    if (!box) return;
+    box.className = `status status--${tone}`;
+    $('status-label').textContent = label;
+    $('status-message').textContent = message || '';
+  }
+
+  /** Libellés des lignes de détail, dans l'ordre où elles s'affichent. */
+  const LABELS = {
+    transaction_id: 'Transaction', id: 'Transaction',
+    fiat_amount: 'Montant', amount: 'Montant', currency: 'Devise',
+    masked_pan: 'Carte', stan: 'STAN', rrn: 'RRN',
+    target_wallet: 'Portefeuille',
+    tx_hash: 'Hash crypto', crypto_tx_hash: 'Hash crypto',
+    created_at: 'Créée le', completed_at: 'Terminée le',
+    error: 'Détail',
+  };
+
+  const ORDER = [
+    'transaction_id', 'id', 'fiat_amount', 'amount', 'currency', 'masked_pan',
+    'stan', 'rrn', 'target_wallet', 'tx_hash', 'crypto_tx_hash',
+    'created_at', 'completed_at', 'error',
+  ];
+
+  //: Champs à présenter comme des dates plutôt que comme de l'ISO 8601 brut.
+  const DATE_FIELDS = new Set(['created_at', 'completed_at']);
+
+  /** « 27/08/2026 à 09:41 », dans le fuseau du lecteur. */
+  function formatDate(iso) {
+    const at = new Date(iso);
+    if (Number.isNaN(at.getTime())) return String(iso);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(at.getDate())}/${pad(at.getMonth() + 1)}/${at.getFullYear()} `
+         + `à ${pad(at.getHours())}:${pad(at.getMinutes())}`;
+  }
+
+  /** Reconstruit la liste de détails à partir d'un objet de réponse. */
+  function showDetails(data) {
+    const list = $('details');
+    if (!list) return;
+    list.textContent = '';
+    if (!data) return;
+
+    const seen = new Set();
+    ORDER.forEach((key) => {
+      const value = data[key];
+      if (value === undefined || value === null || value === '') return;
+      const label = LABELS[key];
+      // `id` et `transaction_id` désignent la même chose selon la réponse.
+      if (seen.has(label)) return;
+      seen.add(label);
+
+      const row = document.createElement('div');
+      row.className = 'details__row';
+      const dt = document.createElement('dt');
+      dt.textContent = label;
+      const dd = document.createElement('dd');
+      dd.textContent = DATE_FIELDS.has(key) ? formatDate(value) : String(value);
+      if (DATE_FIELDS.has(key)) dd.classList.add('details__date');
+      row.append(dt, dd);
+      list.append(row);
+    });
+  }
+
+  // ── Passerelle ────────────────────────────────────────────────────────────
+
   function showHealth(state, text) {
     const pill = $('health');
+    if (!pill) return;
     pill.className = `pill pill--${state}`;
     $('health-label').textContent = text;
   }
@@ -147,18 +179,28 @@ const UI = (() => {
    * que le relais est là pour éviter.
    */
   function setRelayed() {
-    $('settings-toggle').hidden = true;
-    $('settings').hidden = true;
-    $('api-key').value = '';
-    $('base-url').value = '';
+    const toggle = $('settings-toggle');
+    if (toggle) toggle.hidden = true;
+    if ($('settings')) $('settings').hidden = true;
+    if ($('api-key')) $('api-key').value = '';
+    if ($('base-url')) $('base-url').value = '';
     const pill = $('health');
-    pill.title = "L'API est relayée par cette origine ; la clé reste côté serveur.";
-    $('health-label').textContent += ' · relayée';
+    if (pill) pill.title = "L'API est relayée par cette origine ; la clé reste côté serveur.";
+    if ($('health-label')) $('health-label').textContent += ' · relayée';
+  }
+
+  /** Panneau bloquant : la page ne peut pas faire son travail, on dit pourquoi. */
+  function block(reason) {
+    const box = $('blocked');
+    if (!box) return;
+    $('blocked-reason').textContent = reason;
+    box.hidden = false;
   }
 
   return {
-    $, describe, describeHttpError, setFieldError,
-    setBusy, showStatus, showDetails, showHealth, setRelayed,
+    $, describe, describeHttpError,
+    setFieldError, setFieldWarning, showBanner, hideBanner, setBusy,
+    showStatus, showDetails, showHealth, setRelayed, block, formatDate,
     STATUS, HTTP_ERRORS,
   };
 })();

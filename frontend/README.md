@@ -1,8 +1,7 @@
-# frontend — formulaire de paiement libfin
+# frontend — tunnel de paiement libfin
 
-Interface de saisie carte pour la passerelle fiat→crypto (`src/gateway`).
-Trois champs de carte — **numéro**, **CVV**, **date d'expiration** — plus le
-montant et le portefeuille destinataire, que l'API exige.
+Interface client de la passerelle fiat→crypto (`src/gateway`), en **trois
+étapes** : la commande, la carte, la confirmation.
 
 ---
 
@@ -14,29 +13,171 @@ que la bibliothèque standard Python.
 
 C'est délibéré. Une page qui manipule des numéros de carte ne devrait pas
 embarquer un arbre de dépendances que personne ne relit, et le cœur de libfin
-revendique déjà « zero package dependencies ». Le corollaire : les 700 lignes
-de cette interface sont lisibles en une séance.
+revendique déjà « zero package dependencies ».
 
 ### Arborescence
 
 ```
 frontend/
 ├── README.md               ← ce fichier
-├── index.html              ← structure de la page, un seul écran
+├── index.html              ← étape 1 : montant et adresse crypto
+├── payment.html            ← étape 2 : carte, façon 2D Link
+├── result.html             ← étape 3 : état de la transaction
 ├── serve.py                ← serveur : fichiers statiques + relais optionnel
 └── assets/
     ├── css/
     │   └── styles.css      ← thème clair/sombre, aucune police distante
     └── js/
-        ├── card.js         ← règles de carte : Luhn, réseau, formats  (aucun DOM)
-        ├── api.js          ← client HTTP de la passerelle             (aucun DOM)
-        ├── ui.js           ← rendu : erreurs, états, détails          (aucun réseau)
-        └── main.js         ← assemblage : saisie → validation → envoi → suivi
+        ├── card.js         ← règles de carte : Luhn, réseau, formats
+        ├── address.js      ← Keccak-256 et somme de contrôle EIP-55
+        ├── order.js        ← la commande, partagée entre les pages
+        ├── api.js          ← client HTTP de la passerelle
+        ├── ui.js           ← rendu : erreurs, états, détails
+        ├── boot.js         ← amorçage commun aux trois pages
+        ├── order-page.js   ← étape 1
+        ├── payment-page.js ← étape 2
+        └── result-page.js  ← étape 3
 ```
 
-La séparation n'est pas décorative : `card.js` et `api.js` ne touchent pas au
-DOM et se testent isolément ; `ui.js` ne parle jamais au réseau ; `main.js` est
-le seul fichier qui connaît les deux côtés.
+Les quatre premiers modules sont purs : ni DOM, ni réseau au chargement. `ui.js`
+ne parle jamais au réseau. Seuls les trois scripts de page connaissent les deux
+côtés, et chacun ne gouverne que son étape.
+
+---
+
+## Le parcours en trois étapes
+
+```
+index.html            payment.html                 result.html?tx=42
+┌──────────────┐      ┌──────────────────┐         ┌──────────────────┐
+│ Montant      │      │ Récapitulatif    │         │ État + détails   │
+│ Devise       │ ───▶ │ Numéro de carte  │ ──202──▶│ Suivi jusqu'à    │
+│ Adresse 0x…  │      │ Expiration, CVV  │         │ l'état terminal  │
+└──────────────┘      └──────────────────┘         └──────────────────┘
+   validation           POST /pay                    GET /transaction/{id}
+   locale seule
+```
+
+### Pourquoi trois pages et non deux
+
+La remise crypto est asynchrone : `POST /pay` répond `202` dès que le fiat est
+autorisé, et l'issue se lit ensuite sur `GET /transaction/{id}`. Garder ce suivi
+sur la page carte le rendrait fragile — un rechargement perdrait tout, et
+l'adresse ne désignerait rien. Une troisième page portant l'identifiant dans son
+URL se recharge, se met en favori et se partage sans rien perdre.
+
+Accessoirement, cela sépare ce qui doit l'être : l'étape 2 ne montre que la
+carte, comme une page de paiement hébergée, et n'a plus rien à afficher après.
+
+### Comment la commande passe d'une page à l'autre
+
+Deux transports, volontairement redondants ([order.js](assets/js/order.js)) :
+
+1. **`sessionStorage`** — survit à un rechargement, ne salit pas l'URL ;
+2. **les paramètres d'URL** — fonctionnent quand le stockage est refusé
+   (navigation privée) et rendent l'étape 2 adressable :
+   `payment.html?amount=25.00&currency=USD&wallet=0x…` est un lien de paiement
+   tout prêt.
+
+L'étape 2 lit l'URL d'abord, le stockage ensuite, et **revalide dans tous les
+cas** : un paramètre d'URL est une saisie comme une autre. Une commande absente
+ou invalide n'affiche aucun champ carte — seulement un panneau qui dit pourquoi
+et renvoie à l'étape 1.
+
+**Aucune donnée de carte ne transite par ce canal.** Jamais.
+
+---
+
+## Validations et cas d'erreur
+
+Toutes les vérifications locales servent à épargner un aller-retour réseau, pas
+à garantir quoi que ce soit : la passerelle revalide l'intégralité
+([api.py](../src/gateway/api.py)).
+
+### Étape 1 — commande
+
+| Cas | Message |
+|---|---|
+| Montant vide | « Montant requis. » |
+| Montant non numérique, ou plus de deux décimales | « Montant attendu : 25 ou 25.00. » |
+| Montant nul ou négatif | « Le montant doit être strictement positif. » |
+| Adresse vide | « Adresse du portefeuille requise. » |
+| Adresse sans `0x` | « Une adresse Ethereum commence par « 0x ». » |
+| Mauvaise longueur | « Adresse trop courte de 3 caractères (40 attendus après « 0x »). » |
+| Caractère non hexadécimal | « Caractère « z » interdit : seuls 0-9 et a-f sont admis. » |
+| Adresse de destruction | « Cette adresse est une adresse de destruction : les fonds y seraient perdus. » |
+| Somme de contrôle fausse | « Somme de contrôle invalide (EIP-55) : cette adresse comporte une faute de frappe. » |
+| Adresse tout en minuscules | *Avertissement seul* : la somme de contrôle est indisponible, vérifiez caractère par caractère |
+| Passerelle injoignable | Bandeau d'avertissement, puis blocage à la validation — inutile d'envoyer saisir une carte |
+| Stockage du navigateur refusé | Bandeau informatif ; la commande passe par l'URL et le parcours continue |
+| Redirection impossible | Bandeau citant la raison |
+
+Les bornes `AMOUNT_MIN` / `AMOUNT_MAX` **ne sont pas** vérifiées ici : la page ne
+les connaît pas. Un montant hors bornes ressort en `422` à l'étape 2, avec le
+détail du serveur.
+
+### L'adresse crypto, en détail
+
+La passerelle n'accepte qu'une expression régulière, `^0x[a-fA-F0-9]{40}$`. Une
+adresse dont un caractère a été mal recopié la satisfait tout aussi bien — et le
+transfert part alors vers une adresse qui n'appartient à personne, **sans retour
+possible**.
+
+[address.js](assets/js/address.js) ajoute donc la somme de contrôle **EIP-55**,
+encodée dans la casse des lettres hexadécimales. Cela demande Keccak-256, la
+seule primitive que ce projet ne pouvait pas éviter — attention, ce n'est pas
+SHA3-256 : Ethereum utilise le remplissage d'origine, `0x01` là où SHA-3 utilise
+`0x06`. L'implémentation est vérifiée contre les vecteurs officiels et les huit
+adresses de l'EIP-55.
+
+Une adresse valide est réécrite dans sa casse canonique dès que le champ perd le
+focus : le client voit la forme de référence et la compare plus facilement à sa
+source.
+
+### Étape 2 — carte
+
+| Cas | Message |
+|---|---|
+| Numéro vide, trop court ou trop long | « Le numéro doit comporter de 13 à 19 chiffres. » |
+| Longueur incohérente avec le réseau détecté | « Longueur inattendue pour ce réseau (16 chiffres). » |
+| Somme de Luhn fausse | « Numéro invalide (contrôle de Luhn). » |
+| Expiration mal formée | « Format attendu : MM/AA. » |
+| Mois hors 1-12 | « Mois invalide. » |
+| Carte expirée | « Carte expirée. » (valable jusqu'à la fin de son mois) |
+| CVV de mauvaise longueur | « Le CVV comporte 4 chiffres pour ce réseau. » |
+| Commande absente | Panneau bloquant, aucun champ carte affiché |
+| Commande invalide (URL trafiquée) | Panneau bloquant citant le champ fautif |
+| Double envoi | Bouton désactivé **et** verrou interne : jamais deux transactions |
+| `202` sans identifiant | Bandeau demandant de contacter le support sans réessayer |
+| Redirection impossible après acceptation | Bandeau donnant l'URL de suivi et interdisant de recommencer |
+
+### Étape 3 — confirmation
+
+| Cas | Message |
+|---|---|
+| `tx` absent | « Cette page attend un identifiant de transaction, par exemple « result.html?tx=42 ». » |
+| `tx` non numérique | « « abc » n'est pas un identifiant de transaction. » |
+| `404` de la passerelle | « Aucune transaction 42 chez la passerelle. » |
+| Suivi interrompu avant l'issue | Bandeau, et bouton « Actualiser » pour relancer |
+
+### Codes HTTP, à toutes les étapes
+
+Traduits séparément ([ui.js](assets/js/ui.js)). La distinction qui compte : un
+`503` arrive **avant** tout débit, tandis qu'un `504` signifie que l'acquéreur
+n'a jamais répondu et que rejouer le paiement peut débiter deux fois.
+
+| Code | Affiché | |
+|---|---|---|
+| `400` | Paiement refusé | refus bancaire |
+| `401` | Authentification refusée | clé d'API |
+| `404` | Transaction introuvable | |
+| `409` | Requête en conflit | idempotence |
+| `422` | Saisie invalide | détail Pydantic aplati |
+| `429` | Trop de tentatives | `RATE_LIMIT_PER_MINUTE` |
+| `502` | Réseau bancaire indisponible | |
+| `503` | Service indisponible | **aucun débit** |
+| `504` | Sort du débit inconnu | **ne pas rejouer** |
+| réseau | Passerelle injoignable | URL, TLS ou CORS |
 
 ---
 
@@ -64,7 +205,7 @@ Le navigateur ne voit qu'une seule origine. Conséquences :
 * **La clé d'API ne quitte jamais le serveur.** Elle vient de `GATEWAY_API_KEY`.
 * **CORS devient sans objet** — plus rien à configurer.
 * **La page se configure toute seule** : elle détecte le relais et masque le
-  panneau « Connexion », devenu inutile ([main.js:54](assets/js/main.js#L54)).
+  panneau « Connexion », devenu inutile ([boot.js:58](assets/js/boot.js#L58)).
 
 C'est la forme que prend aussi la production, où Nginx joue ce rôle.
 
@@ -138,34 +279,20 @@ hors de portée.
 
 | # | Où | Quoi |
 |---|---|---|
-| 1 | [main.js:129](assets/js/main.js#L129) | construit le corps : PAN en chiffres nus, `12/30` → `3012` |
+| 1 | [payment-page.js:125](assets/js/payment-page.js#L125) | construit le corps : PAN en chiffres nus, `12/30` → `3012`, montant et adresse repris de la commande |
 | 2 | [api.js:146](assets/js/api.js#L146) | `POST /pay` + `X-API-Key`, `Idempotency-Key`, `Content-Type` |
 | 3 | navigateur | en mode 2, préflight `OPTIONS` automatique (en-têtes personnalisés) |
 | 4 | [api.py:152](../src/gateway/api.py#L152) | `CORSMiddleware` répond au préflight |
 | 5 | [api.py:191](../src/gateway/api.py#L191) | `authenticate_api_key` compare la clé |
 | 6 | [api.py:218](../src/gateway/api.py#L218) | `PaymentRequest` revalide tout — Luhn, expiration, bornes |
-| 7 | [main.js:175](assets/js/main.js#L175) | `202` reçu, la page suit `GET /transaction/{id}` |
+| 7 | [payment-page.js:168](assets/js/payment-page.js#L168) | `202` reçu, redirection vers `result.html?tx=…` |
+| 8 | [result-page.js:77](assets/js/result-page.js#L77) | l'étape 3 suit `GET /transaction/{id}` jusqu'à l'état terminal |
 
 `Idempotency-Key` est régénérée à chaque envoi
 ([api.js:64](assets/js/api.js#L64)) au format exigé par la passerelle : un
 double-clic ou un rechargement ne débite pas deux fois.
 
 ---
-
-## Ce que fait la page
-
-1. **Met en forme la saisie** — numéro groupé selon le réseau (4-4-4-4, ou 4-6-5
-   pour American Express), barre oblique de l'expiration, CVV limité à 3 ou 4
-   chiffres selon le réseau détecté.
-2. **Valide avant d'envoyer** — Luhn, longueur cohérente avec le BIN, mois
-   valide, carte non expirée, montant à deux décimales, adresse `0x…` de
-   40 caractères. Ces contrôles évitent un aller-retour réseau pour une faute de
-   frappe ; **la passerelle revalide tout**.
-3. **Suit la remise crypto** — le `202` signifie « fiat autorisé » ; la page
-   interroge `GET /transaction/{id}` toutes les 2,5 s jusqu'à un état terminal,
-   au plus une minute.
-4. **Efface le numéro et le CVV** dès la requête partie, du DOM comme de la
-   portée JavaScript, quelle que soit la réponse.
 
 ### États affichés
 
@@ -182,7 +309,7 @@ Ils reprennent un pour un `TransactionStatus` ([models.py](../src/gateway/models
 | `FIAT_UNKNOWN` | sort du débit inconnu — **ne pas rejouer le paiement** |
 
 Les codes HTTP d'échec sont traduits séparément
-([ui.js:118](assets/js/ui.js#L118)). La distinction qui compte : un `503` arrive
+([ui.js:39](assets/js/ui.js#L39)). La distinction qui compte : un `503` arrive
 **avant** tout débit, un `504` signifie que l'acquéreur n'a jamais répondu et
 que rejouer peut débiter deux fois. Les deux ne s'affichent donc pas pareil.
 
@@ -190,15 +317,24 @@ que rejouer peut débiter deux fois. Les deux ne s'affichent donc pas pareil.
 
 ## Démarrage
 
-### Voir la page seule
+### Voir les pages seules
 
 ```bash
 python3 frontend/serve.py        # http://127.0.0.1:5173
 ```
 
-La pastille affichera **injoignable** — normal, aucune passerelle n'écoute. La
-mise en forme, la détection du réseau, Luhn et le contrôle d'expiration
-fonctionnent quand même : ils s'exécutent dans le navigateur.
+La pastille affichera **injoignable** — normal, aucune passerelle n'écoute, et
+l'étape 1 refusera de passer à l'étape 2. Pour inspecter les pages malgré tout,
+elles s'ouvrent directement :
+
+```
+http://127.0.0.1:5173/index.html
+http://127.0.0.1:5173/payment.html?amount=25.00&currency=USD&wallet=0x742d35Cc6634C0532925a3b844Bc454e4438f44e
+http://127.0.0.1:5173/result.html?tx=1
+```
+
+Toutes les validations locales — Luhn, EIP-55, expiration, formats — fonctionnent
+sans passerelle : elles s'exécutent dans le navigateur.
 
 ### Avec la passerelle de simulation
 
@@ -239,7 +375,8 @@ Portefeuille destinataire pour les essais :
 
 ## Confidentialité des données de carte
 
-* Le PAN et le CVV vivent dans leur champ et dans le corps de la requête. Ils
+* Le PAN et le CVV n'existent qu'à l'étape 2, dans leur champ et dans le corps
+  de la requête. Ils
   n'atteignent ni `sessionStorage`, ni `localStorage`, ni la console.
 * Les champs sont vidés dès l'envoi, et les valeurs effacées de la portée JS.
 * Seul le PAN masqué (`411111******1111`) est affiché.

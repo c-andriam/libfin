@@ -106,6 +106,137 @@ body {
   align-items: start;
 }
 
+/* Les trois étapes se lisent en colonne : une seule chose à faire par écran. */
+.layout--single {
+  max-width: 560px;
+  display: block;
+}
+
+/* ── Fil des étapes ───────────────────────────────────────────────────── */
+
+.steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.steps__item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.steps__item + .steps__item::before {
+  content: "";
+  width: 22px;
+  height: 1px;
+  background: var(--border);
+  margin-right: 6px;
+}
+
+.steps__item a {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: inherit;
+  text-decoration: none;
+}
+.steps__item a:hover { color: var(--text); }
+
+.steps__num {
+  display: grid;
+  place-items: center;
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.steps__item.is-current { color: var(--text); font-weight: 550; }
+.steps__item.is-current .steps__num {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.steps__item.is-done .steps__num { border-color: var(--ok); color: var(--ok); }
+
+/* ── Récapitulatif de commande ────────────────────────────────────────── */
+
+.recap {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 13px 18px 15px;
+  margin-bottom: 16px;
+}
+
+.recap__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 9px;
+  margin-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+.recap__title { font-size: 13px; font-weight: 600; }
+
+.recap__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 3px 0;
+}
+
+.recap__label { color: var(--muted); font-size: 13px; }
+.recap__value { font-size: 15px; }
+.recap__value--mono { font-family: var(--mono); font-size: 13px; }
+
+.recap__edit { font-size: 13px; color: var(--accent); text-decoration: none; }
+.recap__edit:hover { text-decoration: underline; }
+
+/* ── Bandeaux ─────────────────────────────────────────────────────────── */
+
+.banner {
+  margin: 0 0 18px;
+  padding: 11px 14px;
+  border-radius: 8px;
+  font-size: 13.5px;
+  border: 1px solid;
+}
+.banner--error {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 40%, transparent);
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+}
+.banner--warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.panel--blocked { text-align: center; }
+.panel--blocked .panel__lede { margin-bottom: 20px; }
+.panel--blocked .btn--primary { display: inline-flex; width: auto; padding: 10px 20px; }
+
+.result__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+.result__actions .btn { flex: 1; text-align: center; text-decoration: none; }
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -193,11 +324,17 @@ input::placeholder { color: var(--muted); opacity: .6; }
 .row .field > label { flex: none; }
 .field--narrow { max-width: 120px; }
 
+/* Un montant mérite plus de place qu'un code à trois lettres. */
+.row--amount { grid-template-columns: 1fr 120px; }
+
 .hint { margin: 6px 0 0; font-size: 12.5px; color: var(--muted); }
 .hint code, .details code { font-family: var(--mono); font-size: 12px; }
 
 .error { margin: 6px 0 0; font-size: 12.5px; color: var(--err); min-height: 0; }
 .error:empty { display: none; }
+
+.warn { margin: 6px 0 0; font-size: 12.5px; color: var(--warn); }
+.warn:empty { display: none; }
 
 .tag {
   display: inline-block;
@@ -290,6 +427,8 @@ input::placeholder { color: var(--muted); opacity: .6; }
   font-size: 12.5px;
   overflow-wrap: anywhere;
 }
+/* Une date n'est pas un identifiant : elle se lit mieux en police normale. */
+.details dd.details__date { font-family: var(--sans); font-size: 13px; }
 
 @media (max-width: 780px) {
   .layout, .settings__inner { grid-template-columns: 1fr; }
