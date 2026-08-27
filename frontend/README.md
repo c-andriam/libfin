@@ -386,12 +386,91 @@ Portefeuille destinataire pour les essais :
 
 ---
 
-## Passer en production
+## Peut-on tester avec de vraies cartes ?
 
-Le mode relayé règle la clé d'API. **Une réserve demeure : le PAN transite par
-votre origine**, ce qui place la page dans le périmètre PCI-DSS (SAQ A-EP au
-minimum). Le contournement habituel est un champ hébergé par l'acquéreur —
-iframe ou tokenisation — pour que le numéro n'atteigne jamais votre JavaScript.
+**Non, pas en l'état.** Ce tunnel convient à la simulation, aux démonstrations
+et aux essais d'intégration. Trois blocages sont réglementaires ou
+architecturaux — aucune ligne de code ne les lève — et le reste est une liste
+de choses à ajouter.
+
+### 1. Le périmètre PCI-DSS
+
+Le PAN traverse **votre origine et votre JavaScript**. Cela vous place en
+SAQ A-EP au minimum : questionnaire étendu, analyse de vulnérabilités
+trimestrielle par un ASV, et responsabilité pleine sur le code de la page.
+
+Le contournement habituel est de ne jamais laisser le numéro atteindre votre
+code : **champ hébergé par l'acquéreur** (iframe, ou bibliothèque de
+tokenisation qui remplace le PAN par un jeton avant l'envoi). Le formulaire
+devient alors un conteneur, et vous retombez en SAQ A.
+
+C'est le point structurant : tant qu'il n'est pas tranché, le reste est
+prématuré.
+
+### 2. Aucune authentification du porteur (3-D Secure)
+
+Il n'y a **aucun 3-D Secure** dans ce dépôt — ni côté passerelle, ni côté
+page. Le « 2D » du nom le dit littéralement : *two-domain*, l'acquéreur et
+l'émetteur, sans le domaine d'interopérabilité qui porte l'authentification.
+
+Conséquences avec de vraies cartes :
+
+* en Europe, **PSD2/SCA** impose l'authentification forte sur la quasi-totalité
+  du commerce à distance — les émetteurs refuseront en masse (« soft decline »,
+  code `65` ou `1A`) ;
+* sans 3DS, il n'y a **pas de transfert de responsabilité** : toute fraude est
+  à votre charge ;
+* la page n'a aucun moyen de présenter un défi ACS ni d'en recevoir le retour.
+  Il faudrait une étape supplémentaire entre `payment.html` et `result.html`.
+
+### 3. Un contrat acquéreur réel
+
+`BANK_HOST`, TLS mutuel avec certificat client, `ACQUIRER_TERMINAL_ID`,
+`ACQUIRER_MERCHANT_ID` : la passerelle les exige en production, mais ce sont
+des éléments qu'un acquéreur vous délivre après contractualisation.
+
+---
+
+### Ce qu'il faudrait ajouter côté frontend
+
+| # | Manque | Pourquoi ça compte |
+|---|---|---|
+| 1 | **Champ hébergé / tokenisation** à la place du champ PAN | seul moyen de sortir du périmètre SAQ A-EP |
+| 2 | **Étape de défi 3-D Secure** entre l'étape 2 et l'étape 3 | sans elle, SCA impossible et refus massifs |
+| 3 | **Nom du porteur** | exigé par nombre d'acquéreurs en vente à distance |
+| 4 | **Adresse de facturation (AVS)** | réduit sensiblement le taux de refus en CNP |
+| 5 | `autocomplete="cc-number"`, `cc-exp`, `cc-csc` | aujourd'hui `off`, que les navigateurs ignorent souvent ; les valeurs normalisées remplissent mieux et réduisent les fautes de frappe |
+| 6 | **Délai d'inactivité** sur la page carte | un formulaire carte laissé ouvert est un risque |
+| 7 | **Retrait du panneau « Connexion »** | c'est le seul chemin qui met une clé d'API dans le navigateur |
+
+### Ce qu'il faudrait vérifier côté exploitation
+
+* **TLS obligatoire.** `serve.py` sert en clair : il ne doit jamais voir une
+  vraie carte. En production, Nginx termine TLS et sert les fichiers statiques
+  (configuration ci-dessous). L'option `--insecure` désactive la vérification
+  du certificat amont — à proscrire hors simulation.
+* **`CORS_ORIGINS` ne doit pas valoir `*`** — la passerelle le refuse déjà en
+  production. En mode relayé la question ne se pose pas.
+* **`TRUSTED_PROXIES` ne doit pas valoir `*`.** Ce réglage n'est **pas** vérifié
+  par la validation de production : laissé à `*`, n'importe qui peut forger
+  `X-Forwarded-For` et contourner la limitation de débit.
+* **Le vrai `POST /pay` n'a jamais été exercé depuis cette page.** Toutes les
+  vérifications décrites ici ont été menées contre une imitation fidèle du
+  contrat, pas contre le service FastAPI. Un essai bout en bout contre la vraie
+  passerelle, en simulation d'abord, reste à faire.
+
+### Ordre de bataille suggéré
+
+1. Trancher la question du champ hébergé (point 1) — elle décide de tout le reste.
+2. Exercer le parcours contre la **vraie** passerelle en simulation (`make sim`).
+3. Ajouter 3-D Secure de bout en bout, passerelle comprise.
+4. Compléter le formulaire : nom du porteur, AVS, `autocomplete` normalisé.
+5. Passer derrière Nginx avec TLS, puis seulement envisager une carte réelle —
+   en commençant par l'environnement de test de l'acquéreur, jamais en production.
+
+---
+
+## Servir en production
 
 `serve.py` n'est pas une infrastructure de production : il ne termine pas TLS et
 un proxy Python ne remplace pas Nginx. En production, Nginx tient les deux rôles
