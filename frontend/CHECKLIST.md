@@ -4,7 +4,8 @@ Ce que ce tunnel fait déjà, ce qu'il faut installer pour l'exercer, et ce qui
 reste à faire avant qu'une vraie carte le touche.
 
 Voir [README.md](README.md) pour l'architecture et les variables d'environnement
-en détail. Ce document-ci est une liste de tâches.
+en détail. Ce document-ci est une liste de tâches ; [ROADMAP.md](ROADMAP.md)
+donne l'ordre dans lequel les prendre et les décisions qui commandent le reste.
 
 ---
 

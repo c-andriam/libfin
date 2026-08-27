@@ -3,9 +3,9 @@
 Interface client de la passerelle fiat→crypto (`src/gateway`), en **trois
 étapes** : la commande, la carte, la confirmation.
 
-> Pour ce qui reste à faire avant qu'une vraie carte touche ce tunnel — et pour
-> l'environnement et les dépendances nécessaires aux tests — voir
-> **[CHECKLIST.md](CHECKLIST.md)**.
+> Pour l'environnement et les dépendances nécessaires aux tests, et la liste de
+> ce qui reste à faire, voir **[CHECKLIST.md](CHECKLIST.md)**. Pour l'ordre dans
+> lequel s'y prendre et les décisions à trancher, **[ROADMAP.md](ROADMAP.md)**.
 
 ---
 
