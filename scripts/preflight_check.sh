@@ -64,7 +64,12 @@ set +a
 # ── 2. Placeholders ─────────────────────────────────────────────────────────
 section "Unfilled values"
 
-PLACEHOLDERS="$(grep -nE '^[A-Z_]+=.*REPLACE_ME' "${ENV_FILE}" || true)"
+# [A-Z0-9_], not [A-Z_]: without the digits this misses every variable whose
+# name carries one — WEB3_RPC_URL above all. A placeholder API key there is not
+# caught here, only surfaced later as a warning, and the stack would start with
+# an RPC that cannot sign. The header of .env.prod.example promises that any
+# REPLACE_ME blocks the launch; this is what makes that true.
+PLACEHOLDERS="$(grep -nE '^[A-Z0-9_]+=.*REPLACE_ME' "${ENV_FILE}" || true)"
 if [[ -n "${PLACEHOLDERS}" ]]; then
     while IFS= read -r line; do
         block "Still a placeholder: ${line%%=*}"
