@@ -12,6 +12,8 @@ BUMP        ?= bump2version
 PACKAGE     := libfin
 SRC_DIR     := src
 TEST_DIR    := tests
+FRONT_DIR   := frontend
+FRONT_PORT  ?= 5173
 DOCS_DIR    := docs
 DOCS_SOURCE := $(DOCS_DIR)/source
 DOCS_BUILD  := $(DOCS_DIR)/_build
@@ -195,6 +197,29 @@ clean-all: clean clean-build docs-clean ## Nettoyage complet (tout)
 	@echo "  ✔ Nettoyage complet effectué"
 
 # ──────────────────────────────────────────────────────────────
+#  Frontend
+# ──────────────────────────────────────────────────────────────
+.PHONY: front
+front: ## Servir le formulaire seul (http://127.0.0.1:5173)
+	$(PYTHON) $(FRONT_DIR)/serve.py --port $(FRONT_PORT)
+
+.PHONY: front-sim
+front-sim: ## Servir le formulaire en relayant la passerelle de simulation
+	@echo ""
+	@echo "  Relais      : https://localhost:8443 (make sim)"
+	@echo "  Clé d'API   : injectée côté serveur, jamais dans le navigateur"
+	@echo "  CORS        : sans objet, une seule origine"
+	@echo ""
+	GATEWAY_API_KEY=simulation-api-key-not-a-secret \
+	$(PYTHON) $(FRONT_DIR)/serve.py --port $(FRONT_PORT) \
+		--gateway https://localhost:8443 --insecure
+
+.PHONY: front-relay
+front-relay: ## Idem, vers une passerelle quelconque : make front-relay GATEWAY=https://...
+	@test -n "$(GATEWAY)" || { echo "  Précisez GATEWAY=https://votre-passerelle"; exit 1; }
+	@test -n "$$GATEWAY_API_KEY" || echo "  GATEWAY_API_KEY non défini : la passerelle répondra 401"
+	$(PYTHON) $(FRONT_DIR)/serve.py --port $(FRONT_PORT) --gateway $(GATEWAY)
+
 #  Certificats TLS
 # ──────────────────────────────────────────────────────────────
 .PHONY: certs

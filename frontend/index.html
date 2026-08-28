@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Aucune donnée de carte ne doit fuir vers un tiers : pas de CDN, pas de police
+       distante, pas de télémétrie. Tout est servi depuis cette origine. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src *; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — Votre commande</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark" aria-hidden="true">◈</span>
+    <span>libfin<span class="topbar__sub"> · passerelle 2D</span></span>
+  </div>
+  <div class="topbar__right">
+    <span id="health" class="pill pill--idle" title="État de la passerelle">
+      <span class="pill__dot"></span><span id="health-label">non vérifié</span>
+    </span>
+    <button type="button" id="settings-toggle" class="btn btn--ghost" aria-expanded="false"
+            aria-controls="settings">Connexion</button>
+  </div>
+</header>
+
+<section id="settings" class="settings" hidden>
+  <div class="settings__inner">
+    <div class="field">
+      <label for="base-url">URL de la passerelle</label>
+      <input type="url" id="base-url" placeholder="https://localhost:8443" autocomplete="off" spellcheck="false">
+      <p class="hint">Doit figurer dans <code>CORS_ORIGINS</code> côté passerelle.</p>
+    </div>
+    <div class="field">
+      <label for="api-key">Clé d'API <span class="tag tag--warn">dev</span></label>
+      <input type="password" id="api-key" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
+      <p class="hint">Conservée en <code>sessionStorage</code>, effacée à la fermeture de l'onglet.</p>
+    </div>
+    <div class="settings__actions">
+      <button type="button" id="health-check" class="btn btn--ghost">Tester la connexion</button>
+    </div>
+  </div>
+</section>
+
+<main class="layout layout--single">
+  <ol class="steps" aria-label="Étapes du paiement">
+    <li class="steps__item is-current" aria-current="step"><span class="steps__num">1</span>Commande</li>
+    <li class="steps__item"><span class="steps__num">2</span>Paiement</li>
+    <li class="steps__item"><span class="steps__num">3</span>Confirmation</li>
+  </ol>
+
+  <form id="order-form" class="panel" novalidate autocomplete="off">
+    <h1 class="panel__title">Votre commande</h1>
+    <p class="panel__lede">Indiquez le montant à convertir et l'adresse qui recevra la crypto.</p>
+
+    <p class="banner" id="form-error" role="alert" hidden></p>
+
+    <div class="row row--amount">
+      <div class="field">
+        <label for="amount">Montant</label>
+        <input type="text" id="amount" inputmode="decimal" autocomplete="off"
+               placeholder="25.00" aria-describedby="amount-error" spellcheck="false">
+        <p class="error" id="amount-error" role="alert"></p>
+      </div>
+      <div class="field field--narrow">
+        <label for="currency">Devise</label>
+        <select id="currency">
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="wallet">Adresse du portefeuille destinataire</label>
+      <input type="text" id="wallet" autocomplete="off" spellcheck="false"
+             placeholder="0x0000000000000000000000000000000000000000" maxlength="42"
+             aria-describedby="wallet-error wallet-note">
+      <p class="error" id="wallet-error" role="alert"></p>
+      <p class="warn" id="wallet-warn" role="status" hidden></p>
+      <p class="hint" id="wallet-note">
+        Adresse Ethereum : <code>0x</code> suivi de 40 caractères hexadécimaux.
+        La somme de contrôle EIP-55 est vérifiée quand la casse le permet.
+      </p>
+    </div>
+
+    <button type="submit" id="submit" class="btn btn--primary">
+      <span class="btn__label">Continuer vers le paiement</span>
+    </button>
+
+    <p class="disclaimer">
+      Aucune donnée de carte n'est demandée à cette étape.
+    </p>
+  </form>
+</main>
+
+<script src="assets/js/card.js"></script>
+<script src="assets/js/address.js"></script>
+<script src="assets/js/order.js"></script>
+<script src="assets/js/api.js"></script>
+<script src="assets/js/ui.js"></script>
+<script src="assets/js/boot.js"></script>
+<script src="assets/js/order-page.js"></script>
+</body>
+</html>

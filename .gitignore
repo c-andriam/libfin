@@ -256,6 +256,8 @@ testnet-*-wallet.json
 # Certificates issued for the production rehearsal, private keys included.
 acquirer-certs/
 .migration-scratch.db
+# Base de scripts/run_gateway_local.py : jetable, recréée à chaque lancement.
+.local-gateway.db
 .alembic-*.db
 
 # Résultats de validation (suites de chaos, charge). Conservés hors /tmp.

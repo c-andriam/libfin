@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src *; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — État de la transaction</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark" aria-hidden="true">◈</span>
+    <span>libfin<span class="topbar__sub"> · confirmation</span></span>
+  </div>
+  <div class="topbar__right">
+    <span id="health" class="pill pill--idle" title="État de la passerelle">
+      <span class="pill__dot"></span><span id="health-label">non vérifié</span>
+    </span>
+  </div>
+</header>
+
+<main class="layout layout--single">
+  <ol class="steps" aria-label="Étapes du paiement">
+    <li class="steps__item is-done"><a href="index.html"><span class="steps__num">1</span>Commande</a></li>
+    <li class="steps__item is-done"><span class="steps__num">2</span>Paiement</li>
+    <li class="steps__item is-current" aria-current="step"><span class="steps__num">3</span>Confirmation</li>
+  </ol>
+
+  <section class="panel panel--blocked" id="blocked" hidden>
+    <h1 class="panel__title">Transaction introuvable</h1>
+    <p class="panel__lede" id="blocked-reason"></p>
+    <a class="btn btn--primary" href="index.html">Nouveau paiement</a>
+  </section>
+
+  <section class="panel" id="result" aria-live="polite" hidden>
+    <p class="banner" id="form-error" role="alert" hidden></p>
+
+    <div class="status" id="status">
+      <span class="status__dot"></span>
+      <div>
+        <p class="status__label" id="status-label">Chargement…</p>
+        <p class="status__message" id="status-message"></p>
+      </div>
+    </div>
+
+    <dl class="details" id="details"></dl>
+
+    <div class="result__actions">
+      <a class="btn btn--ghost" href="index.html">Nouveau paiement</a>
+      <button type="button" class="btn btn--ghost" id="refresh">Actualiser</button>
+    </div>
+
+    <p class="disclaimer" id="permalink-note"></p>
+  </section>
+</main>
+
+<script src="assets/js/card.js"></script>
+<script src="assets/js/address.js"></script>
+<script src="assets/js/order.js"></script>
+<script src="assets/js/api.js"></script>
+<script src="assets/js/ui.js"></script>
+<script src="assets/js/boot.js"></script>
+<script src="assets/js/result-page.js"></script>
+</body>
+</html>
