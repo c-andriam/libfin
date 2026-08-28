@@ -209,6 +209,9 @@ atlassian-ide-plugin.xml
 # .env.prod
 .env.staging
 .env.local
+# .env.prod is deliberately tracked as a template in this public repo,
+# so the file that actually holds secrets is this one instead.
+.env.prod.local
 # .env.sim is deliberately NOT ignored: every value in it is fake and it is what
 # makes `make sim` work without setup.
 !.env.sim

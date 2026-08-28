@@ -16,7 +16,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXAMPLE="${REPO}/.env.prod.example"
-TARGET="${ENV_FILE:-${REPO}/.env.prod}"
+# .env.prod is tracked, and this repository is public: it is the template.
+# The real file is .env.prod.local, which .gitignore keeps out of git.
+TARGET="${ENV_FILE:-${REPO}/.env.prod.local}"
 
 BOLD=$'\033[1m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 say()  { echo "  $*"; }

@@ -386,7 +386,16 @@ test-robustness: test-concurrency test-chaos test-testnet ## Les trois d'affilé
 # ──────────────────────────────────────────────────────────────
 #  PRODUCTION
 # ──────────────────────────────────────────────────────────────
-PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file .env.prod
+# .env.prod est suivi par git, dans un dépôt public : c'est un modèle, il ne
+# doit porter aucun secret. Le lancement réel pointe sur .env.prod.local, qui
+# n'est pas suivi et que `make env-prod` génère.
+#
+# GATEWAY_ENV_FILE est exporté parce que podman-compose.prod.yml s'en sert pour
+# le `env_file:` des conteneurs applicatifs : sans lui, l'API lirait le modèle
+# et démarrerait avec des placeholders.
+ENV_FILE ?= .env.prod.local
+export GATEWAY_ENV_FILE := $(ENV_FILE)
+PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file $(ENV_FILE)
 
 .PHONY: prod-build
 prod-build: ## Construire l'image de production
@@ -398,7 +407,7 @@ env-prod: ## Créer .env.prod : secrets générés, le reste listé
 
 .PHONY: prod-preflight
 prod-preflight: ## Vérifier que tout est prêt (bloque si non)
-	./scripts/preflight_check.sh
+	ENV_FILE=$(ENV_FILE) ./scripts/preflight_check.sh
 
 .PHONY: prod-migrate
 prod-migrate: ## Appliquer les migrations de schéma (Alembic)
@@ -435,7 +444,7 @@ prod: prod-preflight prod-build ## Lancer la production (preflight → build →
 
 # Le port publié par Nginx. HTTPS_PORT vaut 443 par défaut ; en rootless,
 # .env.prod le remonte au-dessus de 1024, et l'URL de vérification doit suivre.
-PROD_PORT ?= $(shell sed -n 's/^HTTPS_PORT=//p' .env.prod 2>/dev/null | tr -d '\r' | tail -1 | grep . || echo 443)
+PROD_PORT ?= $(shell sed -n 's/^HTTPS_PORT=//p' $(ENV_FILE) 2>/dev/null | tr -d '\r' | tail -1 | grep . || echo 443)
 PROD_URL  ?= https://localhost:$(PROD_PORT)
 
 # ⭐ La commande unique : tout le back, tout le front, une seule origine TLS.
@@ -512,6 +521,15 @@ prod-status: ## État des conteneurs et santé applicative
 	$(PROD_COMPOSE) ps
 	@echo ""
 	@$(PROD_COMPOSE) exec -T gateway-api curl -sf http://127.0.0.1:8000/health || echo "  API injoignable"
+
+# Le premier démarrage a un ordre non évident : le preflight bloque sur
+# VAULT_TOKEN, mais ce token n'existe qu'une fois Vault initialisé — et Vault
+# fait partie de la pile que le preflight garde. Cette cible démarre Vault
+# seul, sans preflight : aucun conteneur applicatif, rien qui puisse toucher
+# une carte.
+.PHONY: prod-vault-bootstrap
+prod-vault-bootstrap: ## Premier démarrage de Vault : init + descellement + token dans .env.prod
+	./scripts/vault_bootstrap_prod.sh
 
 .PHONY: prod-vault-init
 prod-vault-init: ## Initialiser Vault en production (une seule fois)
