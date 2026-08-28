@@ -48,6 +48,30 @@ REDIS_PW="$(openssl rand -hex 32)"
 API_KEY="$(openssl rand -hex 32)"          # preflight wants 32 characters min
 PAN_KEY="$(openssl rand -base64 32)"       # never appears in a URL
 
+# Published ports. The example ships 80/443, which assumes a rootful host —
+# under rootless podman the stack builds, migrates, starts every datastore, and
+# only then fails when nginx cannot bind. Preflight catches it first, but only
+# to send the operator back here to edit by hand. Deciding it at the moment the
+# file is written saves that round trip.
+#
+# The detection mirrors scripts/preflight_check.sh so the two cannot disagree.
+UNPRIV_START="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+IS_ROOTFUL=0
+[[ "$(id -u)" == "0" ]] && IS_ROOTFUL=1
+podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q false && IS_ROOTFUL=1
+
+if (( IS_ROOTFUL )); then
+    HTTP_PORT=80
+    HTTPS_PORT=443
+    PORT_NOTE="rootful host, standard ports"
+else
+    # Clear of the other stacks on the same machine: sim takes 8080/8443, and
+    # scripts/prodtest.sh takes 8081/8444.
+    HTTP_PORT=9080
+    HTTPS_PORT=9443
+    PORT_NOTE="rootless podman cannot bind below ${UNPRIV_START}"
+fi
+
 umask 077
 cp "${EXAMPLE}" "${TARGET}"
 
@@ -59,6 +83,7 @@ sed -i \
     -e "s|REPLACE_ME_API_KEY|${API_KEY}|g" \
     -e "s|REPLACE_ME_PAN_ENCRYPTION_KEY|${PAN_KEY}|g" \
     "${TARGET}"
+sed -i -e "s|^HTTP_PORT=.*|HTTP_PORT=${HTTP_PORT}|" -e "s|^HTTPS_PORT=.*|HTTPS_PORT=${HTTPS_PORT}|" "${TARGET}"
 chmod 600 "${TARGET}"
 
 echo
@@ -72,6 +97,7 @@ say  "                                    into /pay and /transaction, so no"
 say  "                                    browser ever holds it"
 good "PAN_ENCRYPTION_KEY                  generated — back this up, or a"
 say  "                                    reversal cannot decrypt its PAN"
+good "HTTP_PORT=${HTTP_PORT}, HTTPS_PORT=${HTTPS_PORT}          ${PORT_NOTE}"
 
 # What is left is what no script can know.
 echo
@@ -113,5 +139,6 @@ say "                 is, anyone who can reach the API port forges"
 say "                 X-Forwarded-For and walks past the rate limit. It is"
 say "                 only defensible because the API port is never published."
 echo
+say "Form and API will both be on https://localhost:${HTTPS_PORT}/"
 say "Next:  make certs   then   make prod-full"
 echo
