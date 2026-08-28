@@ -53,7 +53,7 @@
       </div>
     </section>
 
-    <form id="payment-form" class="panel" novalidate autocomplete="off">
+    <form id="payment-form" class="panel" novalidate autocomplete="on">
       <h1 class="panel__title">Informations de carte</h1>
       <p class="panel__lede">Le débit fiat est autorisé de façon synchrone ; la remise crypto suit.</p>
 
@@ -62,7 +62,7 @@
       <div class="field">
         <label for="pan">Numéro de carte</label>
         <div class="input-wrap">
-          <input type="text" id="pan" inputmode="numeric" autocomplete="off"
+          <input type="text" id="pan" inputmode="numeric" autocomplete="cc-number"
                  placeholder="4111 1111 1111 1111" maxlength="23"
                  aria-describedby="pan-error" spellcheck="false">
           <span id="brand" class="brand" aria-live="polite"></span>
@@ -73,13 +73,13 @@
       <div class="row">
         <div class="field">
           <label for="expiry">Date d'expiration</label>
-          <input type="text" id="expiry" inputmode="numeric" autocomplete="off"
+          <input type="text" id="expiry" inputmode="numeric" autocomplete="cc-exp"
                  placeholder="MM/AA" maxlength="5" aria-describedby="expiry-error" spellcheck="false">
           <p class="error" id="expiry-error" role="alert"></p>
         </div>
         <div class="field">
           <label for="cvv">CVV / CVC</label>
-          <input type="password" id="cvv" inputmode="numeric" autocomplete="off"
+          <input type="password" id="cvv" inputmode="numeric" autocomplete="cc-csc"
                  placeholder="123" maxlength="4" aria-describedby="cvv-error" spellcheck="false">
           <p class="error" id="cvv-error" role="alert"></p>
         </div>

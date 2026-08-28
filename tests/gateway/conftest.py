@@ -121,11 +121,15 @@ async def bank_server():
 
     yield process
 
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        process.kill()
+    # The simulator may already have exited — a test that kills it, or a crash.
+    # terminate() on a reaped process raises ProcessLookupError on Python 3.14,
+    # which turns a passing run into 14 teardown errors and fails `make check`.
+    if process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
 
 
 @pytest_asyncio.fixture

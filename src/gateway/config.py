@@ -402,6 +402,18 @@ class Settings:
         if "*" in self.cors_origins:
             problems.append("CORS_ORIGINS must not be '*' in production.")
 
+        # Every other sensitive setting is checked here; this one slipped
+        # through. Left at '*', the gateway believes whatever X-Forwarded-For
+        # a client sends — so the per-client rate limit is keyed on a value the
+        # attacker chooses, and RATE_LIMIT_PER_MINUTE stops meaning anything.
+        # Name the proxy instead: behind this stack that is Nginx alone.
+        if "*" in self.trusted_proxies:
+            problems.append(
+                "TRUSTED_PROXIES must not be '*' in production: X-Forwarded-For "
+                "would be attacker-controlled and the rate limit bypassable. "
+                "Name your proxy's address."
+            )
+
         if not self.bank_use_tls:
             problems.append("BANK_USE_TLS must be true in production (card data in transit).")
 

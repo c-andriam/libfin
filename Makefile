@@ -527,6 +527,10 @@ prod-status: ## État des conteneurs et santé applicative
 # fait partie de la pile que le preflight garde. Cette cible démarre Vault
 # seul, sans preflight : aucun conteneur applicatif, rien qui puisse toucher
 # une carte.
+.PHONY: prod-certbot
+prod-certbot: ## Certificat TLS reel : make prod-certbot DOMAIN=... EMAIL=...
+	./scripts/certbot_issue.sh
+
 .PHONY: prod-vault-bootstrap
 prod-vault-bootstrap: ## Premier démarrage de Vault : init + descellement + token dans .env.prod
 	./scripts/vault_bootstrap_prod.sh

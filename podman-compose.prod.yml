@@ -300,6 +300,11 @@ services:
       # pages plus /assets/ are named one by one in the config, so the
       # documentation and serve.py that also live here stay unreachable.
       - ./frontend:/usr/share/nginx/html:ro,z
+      # ACME HTTP-01 challenge. nginx.conf already serves
+      # /.well-known/acme-challenge/ from here on port 80 — the one path the
+      # HTTP server does not redirect — so scripts/certbot_issue.sh can renew
+      # without stopping the gateway.
+      - ./nginx/certbot-webroot:/var/www/certbot:ro,z
     environment:
       # Injected into every proxied request, so the browser never holds a
       # credential and the page needs no configuration at all. The
