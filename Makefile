@@ -392,6 +392,10 @@ PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file .env.prod
 prod-build: ## Construire l'image de production
 	podman build -t gateway:prod -f Containerfile.prod .
 
+.PHONY: env-prod
+env-prod: ## Créer .env.prod : secrets générés, le reste listé
+	./scripts/init_env_prod.sh
+
 .PHONY: prod-preflight
 prod-preflight: ## Vérifier que tout est prêt (bloque si non)
 	./scripts/preflight_check.sh
