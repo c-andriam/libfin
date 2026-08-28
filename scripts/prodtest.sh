@@ -495,7 +495,11 @@ for _ in {1..40}; do
     sleep 3
 done
 
-READY="$(curl -sk -H "X-API-Key: ${API_KEY}" "https://localhost:${HTTPS_PORT}/health/ready")"
+# Asked of the API directly, not through Nginx. Nginx injects the API key on
+# the routes it proxies, so anything it forwarded would be readable without a
+# credential — and this endpoint names every component of the estate. It is
+# deliberately off Nginx's allowlist; see nginx.conf.
+READY="$(podman exec gateway-api-prod curl -sf -H "X-API-Key: ${API_KEY}" http://127.0.0.1:8000/health/ready)"
 echo "  readiness: ${READY}"
 
 # ── 6. A real payment ───────────────────────────────────────────────────────

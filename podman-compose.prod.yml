@@ -296,9 +296,19 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro,z
       - ./nginx/ssl:/etc/nginx/ssl:ro,z
-    # Substitute the container DNS server into the config, then start. The
-    # nameserver address is assigned by the container runtime and is not known
-    # until the container exists, so it cannot be baked into nginx.conf.
+      # The form itself. Read-only: nginx serves these files, and the three
+      # pages plus /assets/ are named one by one in the config, so the
+      # documentation and serve.py that also live here stay unreachable.
+      - ./frontend:/usr/share/nginx/html:ro,z
+    environment:
+      # Injected into every proxied request, so the browser never holds a
+      # credential and the page needs no configuration at all. The
+      # substituted config lands in the container's /tmp, not on disk here.
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:?GATEWAY_API_KEY must be set}
+    # Substitute the container DNS server and the API key into the config,
+    # then start. Neither is known before the container exists: the nameserver
+    # is assigned by the container runtime, and the key must not be written
+    # into a file that lives in the repository.
     command:
       - sh
       - -c
@@ -306,7 +316,10 @@ services:
         RESOLVER=$$(awk '/^nameserver/ {print $$2; exit}' /etc/resolv.conf)
         RESOLVER=$${RESOLVER:-127.0.0.11}
         echo "nginx: resolving upstreams through $${RESOLVER}"
-        sed "s/__RESOLVER__/$${RESOLVER}/" /etc/nginx/nginx.conf > /tmp/nginx.conf
+        if [ -z "$${GATEWAY_API_KEY}" ]; then
+          echo "nginx: GATEWAY_API_KEY is empty - /pay and /transaction will answer 401" >&2
+        fi
+        sed -e "s|__RESOLVER__|$${RESOLVER}|" -e "s|__GATEWAY_API_KEY__|$${GATEWAY_API_KEY}|" /etc/nginx/nginx.conf > /tmp/nginx.conf
         exec nginx -c /tmp/nginx.conf -g 'daemon off;'
     depends_on:
       gateway-api:

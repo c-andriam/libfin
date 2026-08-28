@@ -254,13 +254,14 @@ sim: certs sim-build ## Lancer la simulation complète (build + up + migration +
 	@$(SIM_COMPOSE) logs gateway-token-deployer 2>/dev/null | tail -5 || true
 	@echo ""
 	@echo "  ✔ Simulation lancée."
-	@echo "    API      : https://localhost:8443  (certificat auto-signé → curl -k)"
-	@echo "    Clé API  : voir GATEWAY_API_KEY dans .env.sim"
-	@echo "    Cartes   : 4111111111111111 approuvée · 4000000000000002 refusée"
-	@echo "               4000000000000028 sans réponse · 4000000000000036 reversal refusé"
+	@echo "    Formulaire : https://localhost:8443/   (certificat auto-signé)"
+	@echo "    API        : même origine — /health, /pay, /transaction/<id>"
+	@echo "    Clé API    : posée par Nginx ; en direct, GATEWAY_API_KEY de .env.sim"
+	@echo "    Cartes     : 4111111111111111 approuvée · 4000000000000002 refusée"
+	@echo "                 4000000000000028 sans réponse · 4000000000000036 reversal refusé"
 	@echo ""
-	@echo "    Tester   : make sim-pay"
-	@echo "    Vérifier : make sim-status"
+	@echo "    Tester     : make sim-pay"
+	@echo "    Vérifier   : make sim-status"
 
 .PHONY: sim-up
 sim-up: ## Démarrer la simulation sans reconstruire
@@ -423,9 +424,76 @@ prod: prod-preflight prod-build ## Lancer la production (preflight → build →
 	$(MAKE) prod-migrate
 	$(PROD_COMPOSE) up -d
 	@echo ""
-	@echo "  ✔ Production lancée."
+	@echo "  ✔ Production lancée (passerelle + formulaire, même origine TLS)."
 	@echo "    Si Vault vient de redémarrer : make prod-vault-unseal"
 	@echo "    Vérifier l'état             : make prod-status"
+	@echo "    Tout vérifier d'un coup     : make prod-verify"
+
+# Le port publié par Nginx. HTTPS_PORT vaut 443 par défaut ; en rootless,
+# .env.prod le remonte au-dessus de 1024, et l'URL de vérification doit suivre.
+PROD_PORT ?= $(shell sed -n 's/^HTTPS_PORT=//p' .env.prod 2>/dev/null | tr -d '\r' | tail -1 | grep . || echo 443)
+PROD_URL  ?= https://localhost:$(PROD_PORT)
+
+# ⭐ La commande unique : tout le back, tout le front, une seule origine TLS.
+#
+# `prod-verify` est appelé depuis la recette, non déclaré en prérequis : un
+# `make -j` lancerait les deux de front et vérifierait une pile qui n'est pas
+# encore debout.
+.PHONY: prod-full
+prod-full: prod ## ⭐ Tout lancer : passerelle + formulaire sur une seule origine TLS
+	@echo ""
+	@echo "  Attente de Nginx (la passerelle doit d'abord être saine)..."
+	@i=0; until curl -skf -o /dev/null $(PROD_URL)/health; do i=$$((i+1)); test $$i -lt 60 || { echo "  ✘ Rien sur $(PROD_URL) après deux minutes — make prod-logs"; exit 1; }; sleep 2; done
+	@$(MAKE) --no-print-directory prod-verify
+	@echo ""
+	@echo "  ══════════════════════════════════════════════════════════"
+	@echo "   Le tunnel de paiement est en ligne."
+	@echo ""
+	@echo "   Formulaire : $(PROD_URL)/"
+	@echo "   Étape 2    : $(PROD_URL)/payment.html"
+	@echo "   Étape 3    : $(PROD_URL)/result.html?tx=<id>"
+	@echo ""
+	@echo "   Le navigateur ne voit qu'une origine : Nginx sert les pages et"
+	@echo "   relaie /health, /pay et /transaction/<id> vers la passerelle en"
+	@echo "   y ajoutant X-API-Key. Aucune clé ni URL à saisir dans la page —"
+	@echo "   le panneau « Connexion » se masque de lui-même."
+	@echo "  ══════════════════════════════════════════════════════════"
+	@echo ""
+	@echo "   Si Vault vient de redémarrer : make prod-vault-unseal"
+	@echo "   Logs : make prod-logs · Arrêt : make prod-down"
+
+#  $(call probe,<code attendu>,<chemin>,<libellé>)
+#
+#  « probe » et non « check » : `check` est déjà une cible de ce fichier,
+#  et deux sens pour un même mot se paient à la relecture.
+#
+#  -k parce que le certificat est auto-signé tant qu'aucun vrai n'est installé.
+#  Avec un certificat émis par une AC, le retirer : une vérification qui ne
+#  vérifie rien vaut moins que pas de vérification du tout.
+#
+#  Pas de virgule dans le libellé : $(call) découpe ses arguments dessus.
+probe = code=$$(curl -sk -o /dev/null -w '%{http_code}' $(PROD_URL)$(2) 2>/dev/null || echo 000); printf '  %-5s %-24s %s\n' "$$code" '$(2)' '$(3)'; test "$$code" = '$(1)' || { echo '  ✘ attendu $(1) sur $(2)'; exit 1; }
+
+.PHONY: prod-verify
+prod-verify: ## Vérifier que les deux moitiés répondent sur la même origine
+	@echo ""
+	@echo "  Vérification de $(PROD_URL)"
+	@echo "  ──────────────────────────────────────────────────"
+	@$(call probe,200,/health,passerelle)
+	@$(call probe,200,/,formulaire — étape 1)
+	@$(call probe,200,/payment.html,formulaire — étape 2)
+	@$(call probe,200,/result.html,formulaire — étape 3)
+	@$(call probe,200,/assets/css/styles.css,feuille de style)
+	@$(call probe,200,/assets/js/api.js,client de la passerelle)
+	@# Le montage porte aussi README.md, CHECKLIST.md, ROADMAP.md et serve.py,
+	@# et /health/ready nomme un à un les composants de l'infrastructure. La
+	@# liste blanche de Nginx doit refuser les uns comme l'autre : un 200 ici
+	@# veut dire qu'elle a sauté.
+	@$(call probe,404,/README.md,documentation — hors liste)
+	@$(call probe,404,/serve.py,serve.py — hors liste)
+	@$(call probe,404,/health/ready,readiness — hors liste)
+	@echo ""
+	@echo "  ✔ Formulaire et passerelle répondent sur la même origine."
 
 .PHONY: prod-down
 prod-down: ## Arrêter la production (volumes conservés)

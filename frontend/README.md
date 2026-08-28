@@ -503,28 +503,54 @@ des éléments qu'un acquéreur vous délivre après contractualisation.
 
 `serve.py` n'est pas une infrastructure de production : il ne termine pas TLS et
 un proxy Python ne remplace pas Nginx. En production, Nginx tient les deux rôles
-— servir les fichiers statiques et injecter la clé :
+— servir les fichiers statiques et injecter la clé — et
+[nginx.conf](../nginx/nginx.conf) le fait désormais.
 
-```nginx
-# Fichiers statiques : y copier frontend/
-location / {
-    root /usr/share/nginx/html;
-    try_files $uri $uri/ /index.html;
-}
+Une seule commande monte les deux moitiés :
 
-# L'API, sur la même origine. La clé est ajoutée ici, pas dans le navigateur.
-location ~ ^/(health|pay|transaction/[0-9]+)$ {
-    set $upstream_api "gateway-api:8000";
-    proxy_pass http://$upstream_api;
-    proxy_set_header X-API-Key $gateway_api_key;   # p. ex. via un map/include
-    proxy_read_timeout 30s;
-    proxy_next_upstream off;                       # un paiement ne se rejoue pas
-}
+```sh
+make prod-full
 ```
 
-Voir [nginx.conf](../nginx/nginx.conf) pour le reste (TLS, en-têtes de sécurité,
-limitation de débit). Ce bloc n'y est pas appliqué : il modifierait le routage
-d'une passerelle en service, c'est à vous d'en décider.
+Elle enchaîne `prod-preflight`, la construction de l'image, les migrations,
+`podman-compose up -d`, puis vérifie que le formulaire **et** la passerelle
+répondent sur la même origine — et que ce qui doit rester hors de portée l'est
+(`prod-verify`). Le formulaire est alors sur `https://<hôte>/`.
+
+### Ce que fait Nginx
+
+```
+Navigateur ──→ Nginx :443 ──┬── /  /payment.html  /result.html   fichiers
+                            │   /assets/…                        statiques
+                            │
+                            └── /health  /pay  /transaction/{id} ─→ gateway-api:8000
+                                                    (+ X-API-Key)
+```
+
+Trois différences avec le relais de `serve.py`, toutes voulues :
+
+* **Les fichiers servis sont nommés un à un.** Le répertoire monté porte aussi
+  ce README, `CHECKLIST.md`, `ROADMAP.md` et `serve.py` ; un `try_files $uri`
+  attrape-tout les distribuerait. Tout le reste répond `404`.
+* **`/health/ready` n'est plus joignable de l'extérieur.** Ses noms de
+  composants dessinent l'infrastructure, et la page ne l'appelle jamais.
+* **La clé d'API est posée par `proxy_set_header`**, donc en remplacement :
+  celle qu'un client enverrait de lui-même est écartée.
+
+La clé arrive par la variable d'environnement `GATEWAY_API_KEY` du conteneur
+Nginx et remplace un espace réservé dans la configuration au démarrage — comme
+l'adresse du résolveur, et pour la même raison : ni l'une ni l'autre ne peut
+être écrite dans un fichier du dépôt.
+
+### Conséquence pour la page
+
+Aucune configuration. La page appelle sa propre origine, `/health` répond, et le
+panneau « Connexion » se masque tout seul ([boot.js:58](assets/js/boot.js#L58)).
+Ni URL ni clé ne sont saisies dans le navigateur, et CORS ne concerne plus
+personne.
+
+`make sim` sert le formulaire de la même façon, sur `https://localhost:8443/` :
+la simulation répète exactement la forme de la production.
 
 ---
 
@@ -532,6 +558,9 @@ d'une passerelle en service, c'est à vous d'en décider.
 
 | Commande | Effet |
 |---|---|
+| `make prod-full` | **production complète** : passerelle + formulaire, une seule origine TLS |
+| `make prod-verify` | vérifie que les deux moitiés répondent (et que le reste est `404`) |
+| `make sim` | même assemblage, dépendances simulées, sur `https://localhost:8443/` |
 | `python3 frontend/serve.py` | formulaire seul sur `http://127.0.0.1:5173` |
 | `python3 frontend/serve.py --gateway URL` | mode relayé (avec `GATEWAY_API_KEY`) |
 | `python3 frontend/serve.py --port 8080` | change le port |
@@ -539,6 +568,9 @@ d'une passerelle en service, c'est à vous d'en décider.
 | `make front` | formulaire seul, via le Makefile |
 | `make front-sim` | relayé vers la passerelle de simulation |
 | `make front-relay GATEWAY=https://…` | relayé vers une passerelle quelconque |
+
+Les trois dernières restent des outils de développement : `serve.py` sert en
+clair et ne doit jamais voir une vraie carte.
 
 Depuis WSL, `http://localhost:5173` est directement accessible au navigateur
 Windows : la redirection de la boucle locale s'en charge, aucun réglage requis.
