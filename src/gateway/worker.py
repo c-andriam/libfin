@@ -210,6 +210,16 @@ async def _void_authorization(tx_id: int, reason: str) -> bool:
                         "resolves. Releasing it now would give the crypto away."
                     )
                     return False
+                if onchain == "unknown":
+                    # The node did not answer, so nothing is known about this
+                    # transfer. Treating silence as failure is what turns a
+                    # network outage into a refund for crypto that was in fact
+                    # delivered — money out twice, unrecoverable. Hold the hold.
+                    LOGGER.warning(
+                        f"Transaction {tx_id}: the chain could not be reached about "
+                        f"{tx.crypto_tx_hash}. The hold stays until the node answers."
+                    )
+                    return False
 
             pan = await pan_vault.retrieve(tx_id)
             amount, stan, rrn, sent_at = (
@@ -407,6 +417,15 @@ async def _reverse_transaction(tx_id: int, reason: str) -> bool:
                         LOGGER.warning(
                             f"Transaction {tx_id} is still pending on-chain; "
                             "postponing the reversal."
+                        )
+                        return False
+                    if onchain == "unknown":
+                        # Same rule as the void path: an unreachable node is not
+                        # evidence the transfer failed, and reversing on it repays
+                        # a cardholder who already has the crypto.
+                        LOGGER.warning(
+                            f"Transaction {tx_id}: the chain could not be reached "
+                            "about this transfer; postponing the reversal."
                         )
                         return False
                 finally:

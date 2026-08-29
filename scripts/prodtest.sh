@@ -42,7 +42,16 @@ ENV_FILE=".env.prodtest"
 UNSEAL_KEY_FILE=".prodtest-unseal-key"
 ROOT_TOKEN_FILE=".prodtest-root-token"
 CREDENTIALS_FILE=".prodtest-credentials"
-RPC_URL="${WEB3_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}"
+# Not publicnode. It answers eth_getTransactionReceipt with null for receipts
+# more than a few days old, and a null receipt is indistinguishable from a
+# transaction that never existed. Reconciliation read that as "the transfer
+# failed" and queued reversals for eleven payments whose crypto had already
+# been delivered; only a purged PAN stopped the refunds going out. An endpoint
+# used to decide whether money moved must retain the history that proves it.
+RPC_URL="${WEB3_RPC_URL:-https://sepolia.gateway.tenderly.co}"
+# A different operator, deliberately. A backup pointing at the same provider
+# fails at the same instant as the primary and is redundancy in name only.
+RPC_URL_BACKUP="${WEB3_RPC_URL_BACKUP:-https://1rpc.io/sepolia}"
 CHAIN_ID="${WEB3_CHAIN_ID:-11155111}"
 # The ERC-20 to settle in. LINK is the obvious public choice, but its faucet
 # needs an authenticated account — one more human gate between here and a
@@ -65,6 +74,10 @@ if (( LOCAL_CHAIN )); then
     # explicitly rather than weakening the check; preflight refuses this flag.
     LOCAL_CHAIN_ENV="ALLOW_SIMULATED_CHAIN=true"
     RPC_URL="http://gateway-anvil:8545"
+    # There is only one local chain, so the backup is the same node. Leaving it
+    # pointed at a public testnet would have the worker fail over to a chain
+    # that has never heard of these transactions.
+    RPC_URL_BACKUP="http://gateway-anvil:8545"
     CHAIN_ID=31337
     # Deterministic address of the first contract Anvil's account 0 deploys.
     TOKEN="0x5FbDB2315678afecb367f032d93F642f64180aa3"
@@ -304,7 +317,7 @@ ACQUIRER_PROCESSING_CODE=000000
 ACQUIRER_SEND_CVV=true
 
 WEB3_RPC_URL=${RPC_URL}
-WEB3_RPC_URL_BACKUP=${RPC_URL}
+WEB3_RPC_URL_BACKUP=${RPC_URL_BACKUP}
 WEB3_CHAIN_ID=${CHAIN_ID}
 WEB3_CONFIRMATIONS=2
 WEB3_RECEIPT_TIMEOUT_SEC=300

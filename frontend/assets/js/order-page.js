@@ -86,26 +86,69 @@
         return;
       }
 
-      // Le stockage peut être refusé (navigation privée). Ce n'est pas
-      // bloquant : la commande voyage aussi dans l'URL de l'étape 2.
-      const stored = Order.save({ ...order, createdAt: new Date().toISOString() });
-      const target = `payment.html?${Order.toQuery(order)}`;
+      // Le stockage garde la commande si l'opérateur revient la modifier. Il
+      // n'est pas nécessaire au lien lui-même, qui porte tout dans son URL.
+      Order.save({ ...order, createdAt: new Date().toISOString() });
+      showLink(order);
+    });
 
+    // ── Le lien ─────────────────────────────────────────────────────────────
+    // Cette page ne conduit plus le payeur à l'étape 2 : elle fabrique une
+    // adresse qu'on lui transmet. Le marchand et le payeur sont rarement la
+    // même personne, ni sur le même appareil.
+    function paymentUrl(order) {
+      // Résolue contre l'URL courante plutôt que construite à la main : la page
+      // peut être servie depuis un sous-répertoire, et un chemin absolu codé en
+      // dur produirait un lien mort dès qu'elle l'est.
+      const url = new URL('payment.html', window.location.href);
+      url.search = Order.toQuery(order);
+      return url.toString();
+    }
+
+    function showLink(order) {
+      const link = paymentUrl(order);
+      $('link-url').value = link;
+      $('link-open').href = link;
+      $('link-amount').textContent = Order.format(order);
+      $('link-wallet').textContent = order.wallet;
+
+      $('link-panel').hidden = false;
+      form.hidden = true;
+      UI.hideBanner();
+      setLinkStatus('');
+      $('link-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      $('link-copy').focus();
+    }
+
+    function setLinkStatus(message, tone) {
+      const node = $('link-status');
+      node.textContent = message || '';
+      node.className = tone ? `status status--${tone}` : 'status';
+      node.hidden = !message;
+    }
+
+    $('link-copy').addEventListener('click', async () => {
+      const value = $('link-url').value;
       try {
-        window.location.assign(target);
-      } catch (err) {
-        UI.showBanner(
-          `La redirection a échoué (${err && err.message ? err.message : 'raison inconnue'}). `
-          + 'Ouvrez la page de paiement manuellement.',
-        );
-        return;
+        // navigator.clipboard n'existe qu'en contexte sécurisé, et échoue aussi
+        // quand la permission est refusée. La sélection reste le repli qui
+        // marche partout : le lien est prêt à copier au clavier.
+        if (!navigator.clipboard) throw new Error('presse-papiers indisponible');
+        await navigator.clipboard.writeText(value);
+        setLinkStatus('Lien copié.', 'ok');
+      } catch (_) {
+        const field = $('link-url');
+        field.focus();
+        field.select();
+        setLinkStatus('Copie automatique refusée par le navigateur — le lien est sélectionné, faites Ctrl+C.', 'pending');
       }
+    });
 
-      if (!stored) {
-        // Rien à faire de plus : l'URL porte la commande. On le dit quand même,
-        // au cas où la navigation tarderait.
-        UI.showBanner('Stockage du navigateur indisponible ; la commande voyage par l’URL.', 'warn');
-      }
+    $('link-back').addEventListener('click', () => {
+      $('link-panel').hidden = true;
+      form.hidden = false;
+      setLinkStatus('');
+      $('amount').focus();
     });
   });
 })();

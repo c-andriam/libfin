@@ -60,7 +60,24 @@ async def reconcile(act: bool = True) -> List[str]:
                     anomalies.append(
                         f"Transaction {tx.id} ({tx.crypto_tx_hash}) is still pending on-chain."
                     )
+                elif status == "unknown":
+                    # "unknown" is not an answer about the transfer; it is the
+                    # absence of one. get_onchain_status returns it whenever the
+                    # RPC could not be reached at all, which is indistinguishable
+                    # here from a hash the chain has never heard of. Reversing on
+                    # it refunds cardholders whose crypto was delivered — the one
+                    # error this job exists to prevent, committed by the job
+                    # itself. An unreachable node is a reason to ask again later
+                    # and to wake a human if it persists, never to move money.
+                    anomalies.append(
+                        f"Transaction {tx.id} could not be checked on-chain "
+                        f"({tx.crypto_tx_hash}): the node did not answer. Left as "
+                        f"CRYPTO_SENT; it will be re-checked on the next run."
+                    )
+                    counters["manual"] += 1
                 else:
+                    # Only "failed" reaches here: a receipt exists and its status
+                    # is 0. That is the chain stating the transfer did not happen.
                     anomalies.append(
                         f"Transaction {tx.id} is marked sent but the chain says '{status}' "
                         f"for {tx.crypto_tx_hash}."
