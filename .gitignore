@@ -207,15 +207,15 @@ atlassian-ide-plugin.xml
 # Real environment files. .env.prod holds acquirer credentials, the API key and
 # the PAN encryption key: it must never reach a remote.
 # .env.prod
-.env.staging
-.env.local
+# .env.staging
+# .env.local
 # .env.prod is deliberately tracked as a template in this public repo,
 # so the file that actually holds secrets is this one instead.
-.env.prod.local
+# .env.prod.local
 # .env.sim is deliberately NOT ignored: every value in it is fake and it is what
 # makes `make sim` work without setup.
 !.env.sim
-!.env.prod.example
+# !.env.prod.example
 
 # TLS material. Certificates are generated per environment by `make certs`,
 # or issued by scripts/certbot_issue.sh. The Let's Encrypt account key and
