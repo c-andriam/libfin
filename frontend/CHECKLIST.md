@@ -181,7 +181,13 @@ paquets installés.
       actuel, que les navigateurs ignorent souvent
 - [ ] **Délai d'inactivité** sur la page carte, qui vide les champs
 - [ ] **Retirer le panneau « Connexion »** — seul chemin qui met une clé d'API
-      dans un navigateur *(coût : plus de mode deux-origines)*
+      dans un navigateur *(coût : plus de mode deux-origines)*. Partiellement
+      traité pour `links.html` : `make connect` (`scripts/connect.py`) émet
+      désormais une session temporaire à durée de vie limitée, acceptée sur
+      `/links` à la place de la clé permanente — voir `MANAGEMENT_PATHS` dans
+      `gateway/api.py` et `consumeConnectToken()` dans `assets/js/boot.js`. La clé
+      permanente reste saisissable dans le panneau pour le mode deux-origines ;
+      ce n'est retiré que pour l'usage courant de la console.
 
 ### Backend
 

@@ -306,6 +306,11 @@ sim-decline: ## Tester le refus bancaire (aucun crypto ne doit partir)
 sim-reconcile: ## Lancer la réconciliation à blanc dans la simulation
 	$(SIM_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
 
+.PHONY: sim-connect
+sim-connect: ## Créer une session temporaire pour la console des liens (make sim-connect [TTL=14400], 240min par défaut)
+	$(SIM_COMPOSE) exec -T gateway-api python /app/scripts/connect.py \
+		--ttl $(or $(TTL),14400) --base-url https://localhost:8443
+
 .PHONY: sim-reset
 sim-reset: ## Repartir de zéro (supprime base ET file d'attente)
 	@echo "  ⚠  Réinitialise base et Redis. Les deux ensemble : une file"
@@ -580,6 +585,15 @@ reconcile: ## Réconcilier la base et la chaîne (production)
 .PHONY: reconcile-dry
 reconcile-dry: ## Réconciliation en lecture seule (production)
 	$(PROD_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
+
+# La console des liens (/links) n'hérite jamais de la clé injectée par Nginx —
+# volontairement, voir nginx.conf. `connect` en donne un accès temporaire sans
+# jamais faire circuler GATEWAY_API_KEY : le jeton expire de lui-même et ne
+# peut être créé que d'ici, jamais depuis une requête HTTP.
+.PHONY: connect
+connect: ## Créer une session temporaire pour la console des liens (make connect [TTL=14400], 240min par défaut)
+	$(PROD_COMPOSE) exec -T gateway-api python /app/scripts/connect.py \
+		--ttl $(or $(TTL),14400) --base-url $(PROD_URL)
 
 .PHONY: security-audit
 security-audit: ## Analyse statique de sécurité et audit des dépendances

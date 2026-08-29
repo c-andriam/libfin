@@ -22,6 +22,7 @@ from gateway.acquirer import AcquirerService, AuthorizationTimeout
 from gateway.action_codes import describe, is_approved
 from gateway.circuit_breaker import web3_circuit_breaker
 from gateway.config import settings
+from gateway import connect_sessions
 from gateway.currency import UnsupportedCurrency, get as get_currency
 from gateway.database import async_session, engine, get_session, init_db
 from gateway.exchange_rate import RateUnavailable, apply_spread, build_rate_source
@@ -163,6 +164,15 @@ PUBLIC_PATHS = {"/health"}
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
 
+#: The link-management console: list, enable/disable, delete. Nginx and
+#: frontend/serve.py both single this group out to never inherit the relay's
+#: injected key, because it discloses destination wallets and can destroy
+#: links — see the matching MANAGEMENT pattern in frontend/serve.py. It is the
+#: one place a `make connect` session (gateway.connect_sessions) is honoured
+#: instead of the permanent key; every other route accepts the permanent key
+#: only.
+MANAGEMENT_PATHS = re.compile(r"^/links(/\d+)?$")
+
 
 @app.middleware("http")
 async def attach_correlation_id(request: Request, call_next):
@@ -198,9 +208,13 @@ async def authenticate_api_key(request: Request, call_next):
         return await call_next(request)
 
     provided = request.headers.get("X-API-Key", "")
-    if not secrets.compare_digest(provided, settings.api_key):
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key."})
-    return await call_next(request)
+    if secrets.compare_digest(provided, settings.api_key):
+        return await call_next(request)
+
+    if provided and MANAGEMENT_PATHS.match(request.url.path) and await connect_sessions.verify(provided):
+        return await call_next(request)
+
+    return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key."})
 
 
 @app.exception_handler(Exception)
