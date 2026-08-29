@@ -11,7 +11,7 @@
 </head>
 <body>
 
-<header class="topbar">
+<header class="topbar" id="topbar">
   <div class="topbar__brand">
     <span class="topbar__mark" aria-hidden="true">◈</span>
     <span>libfin<span class="topbar__sub"> · paiement sécurisé</span></span>
@@ -24,7 +24,7 @@
 </header>
 
 <main class="layout layout--single">
-  <ol class="steps" aria-label="Étapes du paiement">
+  <ol class="steps" id="steps" aria-label="Étapes du paiement">
     <li class="steps__item is-done"><a href="index.html"><span class="steps__num">1</span>Commande</a></li>
     <li class="steps__item is-current" aria-current="step"><span class="steps__num">2</span>Paiement</li>
     <li class="steps__item"><span class="steps__num">3</span>Confirmation</li>
@@ -34,24 +34,10 @@
   <section class="panel panel--blocked" id="blocked" hidden>
     <h1 class="panel__title">Commande introuvable</h1>
     <p class="panel__lede" id="blocked-reason"></p>
-    <a class="btn btn--primary" href="index.html">Revenir à l'étape 1</a>
+    <a class="btn btn--primary" id="blocked-action" href="index.html">Revenir à l'étape 1</a>
   </section>
 
   <div id="checkout" hidden>
-    <section class="recap" aria-label="Récapitulatif de la commande">
-      <div class="recap__head">
-        <span class="recap__title">Votre commande</span>
-        <a class="recap__edit" href="index.html">Modifier</a>
-      </div>
-      <div class="recap__row">
-        <span class="recap__label">Montant</span>
-        <strong class="recap__value" id="recap-amount"></strong>
-      </div>
-      <div class="recap__row">
-        <span class="recap__label">Destinataire</span>
-        <span class="recap__value recap__value--mono" id="recap-wallet" title=""></span>
-      </div>
-    </section>
 
     <form id="payment-form" class="panel" novalidate autocomplete="on">
       <h1 class="panel__title">Informations de carte</h1>

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src *; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — Mes liens de paiement</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark" aria-hidden="true">◈</span>
+    <span>libfin<span class="topbar__sub"> · mes liens</span></span>
+  </div>
+  <div class="topbar__right">
+    <a href="index.html" class="btn btn--ghost">Nouveau lien</a>
+    <button type="button" id="settings-toggle" class="btn btn--ghost" aria-expanded="false"
+            aria-controls="settings">Connexion</button>
+  </div>
+</header>
+
+<section id="settings" class="settings" hidden>
+  <div class="settings__inner">
+    <div class="field">
+      <label for="base-url">URL de la passerelle</label>
+      <input type="url" id="base-url" placeholder="https://localhost:8443" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="api-key">Clé d'API</label>
+      <input type="password" id="api-key" placeholder="X-API-Key" autocomplete="off" spellcheck="false">
+      <p class="hint">
+        Obligatoire ici. Cette page liste des adresses de destination et permet
+        de supprimer des liens : le relais ne fournit pas la clé à sa place.
+      </p>
+    </div>
+    <div class="settings__actions">
+      <button type="button" id="health-check" class="btn btn--ghost">Tester la connexion</button>
+    </div>
+  </div>
+</section>
+
+<main class="layout layout--single">
+  <section class="panel">
+    <h1 class="panel__title">Mes liens de paiement</h1>
+    <p class="panel__lede">
+      Chaque lien reste payable jusqu'à ce que vous le désactiviez ou le
+      supprimiez. Un lien désactivé garde son historique et peut être remis en
+      service ; un lien supprimé disparaît, mais les paiements qu'il a produits
+      restent enregistrés.
+    </p>
+
+    <p class="banner" id="form-error" role="alert" hidden></p>
+
+    <div class="settings__actions">
+      <button type="button" id="reload" class="btn btn--ghost">Actualiser</button>
+    </div>
+
+    <p class="empty" id="empty" hidden>
+      <span class="empty__mark" aria-hidden="true">◇</span>
+      Aucun lien pour le moment. Créez-en un depuis « Nouveau lien ».
+    </p>
+
+    <div id="rows"></div>
+  </section>
+</main>
+
+<script src="assets/js/card.js"></script>
+<script src="assets/js/address.js"></script>
+<script src="assets/js/order.js"></script>
+<script src="assets/js/api.js"></script>
+<script src="assets/js/ui.js"></script>
+<script src="assets/js/boot.js"></script>
+<script src="assets/js/links-page.js"></script>
+</body>
+</html>

@@ -86,31 +86,62 @@
         return;
       }
 
-      // Le stockage garde la commande si l'opérateur revient la modifier. Il
-      // n'est pas nécessaire au lien lui-même, qui porte tout dans son URL.
+      // Le stockage garde la commande si l'opérateur revient la modifier. Le
+      // lien, lui, n'en dépend plus : il ne porte qu'un jeton.
       Order.save({ ...order, createdAt: new Date().toISOString() });
-      showLink(order);
+      issueLink(order);
     });
+
+    async function issueLink(order) {
+      UI.setBusy(true, 'Création du lien…');
+      let issued;
+      try {
+        issued = await Gateway.createLink(order);
+      } catch (err) {
+        const view = UI.describeHttpError(err.status);
+        UI.showBanner(`${view.label} — ${err.message}`, 'error');
+        return;
+      } finally {
+        UI.setBusy(false, 'Générer le lien de paiement');
+      }
+      showLink(order, issued);
+    }
 
     // ── Le lien ─────────────────────────────────────────────────────────────
     // Cette page ne conduit plus le payeur à l'étape 2 : elle fabrique une
     // adresse qu'on lui transmet. Le marchand et le payeur sont rarement la
     // même personne, ni sur le même appareil.
-    function paymentUrl(order) {
+    function paymentUrl(token) {
       // Résolue contre l'URL courante plutôt que construite à la main : la page
       // peut être servie depuis un sous-répertoire, et un chemin absolu codé en
       // dur produirait un lien mort dès qu'elle l'est.
       const url = new URL('payment.html', window.location.href);
-      url.search = Order.toQuery(order);
+      // Le jeton, et rien d'autre. Le montant et l'adresse sont restés côté
+      // serveur : ils ne sont ni lisibles par qui reçoit le lien, ni
+      // modifiables par qui le paie.
+      url.search = new URLSearchParams({ l: token }).toString();
       return url.toString();
     }
 
-    function showLink(order) {
-      const link = paymentUrl(order);
+    function showLink(order, issued) {
+      const link = paymentUrl(issued.token);
       $('link-url').value = link;
       $('link-open').href = link;
       $('link-amount').textContent = Order.format(order);
       $('link-wallet').textContent = order.wallet;
+
+      // L'expiration est décidée par le serveur, pas devinée ici : une durée
+      // affichée qui ne serait pas celle appliquée tromperait le marchand sur
+      // le temps dont dispose son client.
+      const expires = issued && issued.expires_at ? new Date(issued.expires_at) : null;
+      const dated = expires && !Number.isNaN(expires.valueOf());
+      // Sans date, le lien vit jusqu'à ce qu'on le retire : le dire ainsi
+      // plutôt qu'afficher une échéance vide, qui laisserait croire à un
+      // réglage manquant.
+      $('link-expires').textContent = dated ? expires.toLocaleString() : 'jusqu’à suppression';
+      $('link-expiry').textContent = dated
+        ? `Il expire le ${expires.toLocaleString()}.`
+        : 'Il reste valable tant que vous ne le retirez pas.';
 
       $('link-panel').hidden = false;
       form.hidden = true;

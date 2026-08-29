@@ -11,7 +11,7 @@
 </head>
 <body>
 
-<header class="topbar">
+<header class="topbar" id="topbar">
   <div class="topbar__brand">
     <span class="topbar__mark" aria-hidden="true">◈</span>
     <span>libfin<span class="topbar__sub"> · confirmation</span></span>
@@ -24,7 +24,7 @@
 </header>
 
 <main class="layout layout--single">
-  <ol class="steps" aria-label="Étapes du paiement">
+  <ol class="steps" id="steps" aria-label="Étapes du paiement">
     <li class="steps__item is-done"><a href="index.html"><span class="steps__num">1</span>Commande</a></li>
     <li class="steps__item is-done"><span class="steps__num">2</span>Paiement</li>
     <li class="steps__item is-current" aria-current="step"><span class="steps__num">3</span>Confirmation</li>
@@ -33,7 +33,7 @@
   <section class="panel panel--blocked" id="blocked" hidden>
     <h1 class="panel__title">Transaction introuvable</h1>
     <p class="panel__lede" id="blocked-reason"></p>
-    <a class="btn btn--primary" href="index.html">Nouveau paiement</a>
+    <a class="btn btn--primary" id="blocked-new" href="index.html">Nouveau paiement</a>
   </section>
 
   <section class="panel" id="result" aria-live="polite" hidden>
@@ -50,7 +50,7 @@
     <dl class="details" id="details"></dl>
 
     <div class="result__actions">
-      <a class="btn btn--ghost" href="index.html">Nouveau paiement</a>
+      <a class="btn btn--ghost" id="result-new" href="index.html">Nouveau paiement</a>
       <button type="button" class="btn btn--ghost" id="refresh">Actualiser</button>
     </div>
 

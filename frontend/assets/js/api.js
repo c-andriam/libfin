@@ -149,6 +149,36 @@ const Gateway = (() => {
     headers: { 'Idempotency-Key': idempotencyKey() },
   });
 
+  /** Crée un lien de paiement. Renvoie `{ token, expires_at }`. */
+  const createLink = (order) => request('/link', {
+    method: 'POST',
+    body: { amount: order.amount, currency: order.currency, target_wallet: order.wallet },
+  });
+
+  /**
+   * Ce qu'un lien facture. La réponse ne porte que le montant et la devise :
+   * l'adresse de destination reste côté serveur, et le payeur n'a pas à la
+   * connaître pour régler.
+   */
+  const readLink = (token) => request(`/link/${encodeURIComponent(token)}`, { timeoutMs: 15000 });
+
+  /**
+   * Les liens existants. Contrairement au reste, ces trois appels exigent que
+   * l'exploitant fournisse lui-même la clé : le relais ne l'ajoute pas pour
+   * eux, parce qu'ils divulguent des adresses de destination et permettent de
+   * supprimer. Sans clé saisie dans « Connexion », la passerelle répond 401.
+   */
+  const links = () => request('/links', { timeoutMs: 15000 });
+
+  const setLinkActive = (id, active) => request(`/links/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: { active },
+  });
+
+  const deleteLink = (id) => request(`/links/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+
   /** État courant d'une transaction. */
   const transaction = (id) => request(`/transaction/${encodeURIComponent(id)}`, { timeoutMs: 15000 });
 
@@ -177,7 +207,8 @@ const Gateway = (() => {
     return last;
   }
 
-  return { config, health, pay, transaction, poll, GatewayError, TERMINAL, idempotencyKey, readError };
+  return { config, health, pay, createLink, readLink, links, setLinkActive, deleteLink,
+    transaction, poll, GatewayError, TERMINAL, idempotencyKey, readError };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = Gateway;

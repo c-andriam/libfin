@@ -272,6 +272,11 @@ class Settings:
         self.trusted_proxies: List[str] = [
             p.strip() for p in _env("TRUSTED_PROXIES", "*").split(",") if p.strip()
         ]
+        #: Seconds before a new payment link expires. Zero — the default —
+        #: means no deadline: a link is retired from the console, by the person
+        #: who created it, rather than by a clock they never set. Set a positive
+        #: value only where every link is genuinely a one-off invoice.
+        self.payment_link_ttl_sec: int = _env_int("PAYMENT_LINK_TTL_SEC", 0)
         self.amount_min: Decimal = _env_decimal("AMOUNT_MIN", "1.00")
         self.amount_max: Decimal = _env_decimal("AMOUNT_MAX", "10000.00")
 

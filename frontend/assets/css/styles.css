@@ -438,3 +438,11 @@ input::placeholder { color: var(--muted); opacity: .6; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ── Lien de paiement hébergé ─────────────────────────────────────────── */
+/* Ouverte depuis un lien, la page perd sa barre de titre et son fil
+   d'étapes : sans eux le premier panneau colle au haut de la fenêtre, et
+   l'espace que la barre occupait doit être rendu explicitement. */
+body.is-hosted-link .layout {
+  padding-top: 48px;
+}

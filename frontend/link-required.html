@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — paiement sécurisé</title>
+  <link rel="stylesheet" href="assets/css/styles.css">
+</head>
+<body class="is-hosted-link">
+
+<main class="layout layout--single">
+  <!-- Aucun script : cette page n'a rien à demander à personne, et une page
+       servie à tout visiteur d'une origine publique est celle qui mérite le
+       moins de code. -->
+  <section class="panel">
+    <h1 class="panel__title">Il vous faut un lien de paiement</h1>
+    <p class="panel__lede">
+      Cette adresse ne sert que des paiements déjà préparés. Un lien valide
+      ressemble à <code>…/payment.html?l=</code> suivi d'un jeton.
+    </p>
+    <p class="hint">
+      Si vous en avez reçu un, ouvrez-le entièrement — un lien coupé en deux par
+      une messagerie ne fonctionnera pas. S'il indique qu'il n'est plus valable,
+      c'est qu'il a expiré ou qu'il a déjà servi : demandez-en un nouveau à la
+      personne qui vous l'a envoyé.
+    </p>
+  </section>
+</main>
+
+</body>
+</html>
