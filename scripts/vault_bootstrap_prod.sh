@@ -45,7 +45,10 @@ done
 # Never re-initialise. A second `operator init` against a Vault that already
 # holds the hot wallet key would be refused by Vault itself, but checking first
 # turns a confusing error into a clear one — and makes this safe to re-run.
-if "${VAULT_EXEC[@]}" vault status 2>/dev/null | grep -q "Initialized.*true"; then
+# Captured, not piped: under `set -o pipefail` a sealed Vault's exit code 2
+# would become the pipeline's, and the test would fail whatever grep found.
+if grep -q "Initialized.*true" \
+        <<<"$("${VAULT_EXEC[@]}" vault status 2>/dev/null || true)"; then
     echo
     good "Vault is already initialised — nothing to do."
     say  "If it is sealed:      make prod-vault-unseal"
@@ -68,7 +71,10 @@ mapfile -t UNSEAL_KEYS < <(echo "${INIT_JSON}" | python3 -c \
 for i in 0 1 2; do
     "${VAULT_EXEC[@]}" vault operator unseal "${UNSEAL_KEYS[$i]}" >/dev/null 2>&1
 done
-"${VAULT_EXEC[@]}" vault status 2>/dev/null | grep -q "Sealed.*false" \
+# Captured, not piped: under `set -o pipefail` a sealed Vault's exit code 2
+# would become the pipeline's, and the test would fail whatever grep found.
+grep -q "Sealed.*false" \
+        <<<"$("${VAULT_EXEC[@]}" vault status 2>/dev/null || true)" \
     || { bad "Vault is still sealed after three keys."; exit 1; }
 
 # Only the token goes into the file. The unseal keys are deliberately NOT

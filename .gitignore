@@ -271,3 +271,5 @@ acquirer-certs/
 # Résultats de validation (suites de chaos, charge). Conservés hors /tmp.
 .validation/*.log
 .prodtest-credentials
+.certbot/
+.certbot-venv/
