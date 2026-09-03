@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import json
 import logging
 import re
 import secrets
@@ -35,6 +36,8 @@ from gateway.observability import (
     transaction_id as transaction_id_var,
 )
 from gateway.pan_vault import get_pan_vault
+from gateway.paymegate import PayMeGateClient, verify_webhook_signature
+from gateway.prestataires import router as prestataires_router
 
 LOGGER = logging.getLogger(__name__)
 
@@ -155,9 +158,11 @@ app.add_middleware(
     # Credentials cannot be combined with a wildcard origin, and the gateway
     # authenticates with a header rather than a cookie anyway.
     allow_credentials=not (settings.cors_origins == ["*"]),
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["X-API-Key", "Idempotency-Key", "Content-Type"],
 )
+
+app.include_router(prestataires_router)
 
 #: Endpoints reachable without an API key. Deliberately short.
 PUBLIC_PATHS = {"/health"}
@@ -257,27 +262,11 @@ class PaymentRequest(BaseModel):
         pattern=r"^[A-Za-z]{3}$",
         description="ISO 4217 currency of the amount, e.g. USD, EUR, GBP",
     )
-    target_wallet: Optional[str] = Field(default=None, pattern=r"^0x[a-fA-F0-9]{40}$")
-
-    @model_validator(mode="after")
-    def one_form_or_the_other(self):
-        if self.link:
-            # Accepting both would leave it ambiguous which one governs, and
-            # every such ambiguity is eventually resolved in the attacker's
-            # favour. Refuse rather than silently prefer one.
-            stated = [n for n in ("amount", "target_wallet") if getattr(self, n) is not None]
-            if stated:
-                raise ValueError(
-                    "Send either 'link' or the order fields, not both "
-                    f"(got 'link' with {', '.join(sorted(stated))})."
-                )
-        else:
-            missing = [n for n in ("amount", "target_wallet") if getattr(self, n) is None]
-            if missing:
-                raise ValueError(
-                    f"Missing {', '.join(sorted(missing))}; send them, or a 'link' instead."
-                )
-        return self
+    target_wallet: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+    #: Optional customer contact forwarded to PayMeGate (required there for the
+    #: order). Defaults to a placeholder; the hosted checkout does not echo it to
+    #: the payer.
+    customer_email: str = Field(default="", max_length=256)
 
     @field_validator("currency")
     @classmethod
@@ -321,6 +310,10 @@ class PaymentResponse(BaseModel):
     fiat_amount: Decimal
     tx_hash: Optional[str] = None
     stan: Optional[str] = None
+    #: Present only in PayMeGate mode: the URL to redirect the customer to the
+    #: hosted checkout. The payment is collected there, not by this gateway.
+    checkout_url: Optional[str] = None
+    order_uuid: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +466,119 @@ def _duplicate_response(existing: Transaction) -> "PaymentResponse":
         fiat_amount=existing.amount,
         tx_hash=existing.crypto_tx_hash,
         stan=existing.stan,
+    )
+
+
+async def _process_paymegate_order(
+    request: Request,
+    payment_req: PaymentRequest,
+    idempotency_key: str,
+) -> "PaymentResponse":
+    """PayMeGate mode: create a hosted-checkout order and hand back the URL.
+
+    Everything below this point in :func:`process_payment` is the ISO 8583 / hot
+    wallet path, which PayMeGate does not use: the customer pays on PayMeGate's
+    page and PayMeGate settles the crypto to our configured wallet. The order
+    is created server-to-server, the outcome arrives later via the ``order.paid``
+    webhook.
+    """
+    # ── Idempotency ─────────────────────────────────────────────────────────
+    if idempotency_key is not None and not IDEMPOTENCY_KEY_PATTERN.match(idempotency_key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Idempotency-Key must be 8 to 64 characters, using letters, digits, "
+                "and any of _ . : -"
+            ),
+        )
+
+    if idempotency_key:
+        async with async_session() as session:
+            existing = (
+                await session.execute(
+                    select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+                )
+            ).scalar_one_or_none()
+            if existing:
+                LOGGER.info(
+                    f"Idempotency hit for key={idempotency_key} (transaction {existing.id})."
+                )
+                return _duplicate_response(existing)
+
+    # ── Persist before creating the remote order, so a crash between the two
+    # ── leaves a row whose absence would otherwise lose the payment.
+    async with async_session() as session:
+        transaction = Transaction(
+            amount=payment_req.amount,
+            currency=get_currency(payment_req.currency).numeric,
+            masked_pan=mask_pan(payment_req.pan),
+            target_wallet=payment_req.target_wallet,
+            idempotency_key=idempotency_key,
+            status=TransactionStatus.PENDING,
+            # No locked exchange rate here: PayMeGate converts and settles in
+            # its own currency, so the customer-facing amount is fiat-as-quoted.
+        )
+        session.add(transaction)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            existing = (
+                await session.execute(
+                    select(Transaction).where(Transaction.idempotency_key == idempotency_key)
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise HTTPException(status_code=409, detail="Conflicting request.")
+            return _duplicate_response(existing)
+        await session.refresh(transaction)
+        tx_id = transaction.id
+    transaction_id_var.set(tx_id)
+
+    # They need a valid card number to get here (Luhn validated below in the
+    # shared path), but the raw PAN is neither stored nor forwarded — the card
+    # is actually processed by PayMeGate's hosted checkout, not by us.
+    try:
+        client = PayMeGateClient()
+        # A webhook may not exist yet; best-effort populate an externalId so the
+        # order.paid event correlates back to our row without a local claim.
+        external_id = f"libfin-{tx_id}"
+
+        order = await client.create_order(
+            amount=payment_req.amount,
+            currency=payment_req.currency,
+            external_id=external_id,
+            customer_email=payment_req.customer_email or "customer@example.com",
+            customer_name=None,
+            return_url=None,
+            metadata={"transaction_id": tx_id},
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error(f"PayMeGate order creation failed for transaction {tx_id}: {exc}")
+        await _fail_transaction(tx_id, TransactionStatus.FIAT_DECLINED, str(exc))
+        raise HTTPException(status_code=502, detail="Payment provider unavailable.")
+
+    order_uuid = order.get("orderUUID")
+    checkout_url = order.get("checkoutUrl")
+    if not checkout_url:
+        LOGGER.error(f"PayMeGate did not return a checkoutUrl for order {order_uuid}.")
+        await _fail_transaction(tx_id, TransactionStatus.FIAT_DECLINED, "no checkoutUrl")
+        raise HTTPException(status_code=502, detail="Payment provider misconfigured.")
+
+    # Remember the remote handle so the webhook can match the row.
+    async with async_session() as session:
+        tx = await session.get(Transaction, tx_id)
+        tx.paymegate_order_id = order_uuid
+        await session.commit()
+
+    LOGGER.info(f"Transaction {tx_id}: PayMeGate order {order_uuid} created.")
+    return PaymentResponse(
+        status="PENDING",
+        message="Redirecting to the payment provider.",
+        transaction_id=tx_id,
+        fiat_amount=payment_req.amount,
+        checkout_url=checkout_url,
+        order_uuid=order_uuid,
     )
 
 
@@ -672,6 +778,14 @@ async def process_payment(
     ``pool_timeout``, which is how a busy period turns into an outage. Each
     block below opens a session, does its work, and gives the connection back.
     """
+
+    # ── PayMeGate mode ──────────────────────────────────────────────────────
+    # The customer pays on PayMeGate's hosted checkout, so none of the ISO 8583 /
+    # hot-wallet path below applies: no authorisation hold, no capture, no
+    # reversal, and no web3 signing. We create the order, return the checkout
+    # URL, and let the order.paid webhook record the outcome.
+    if settings.acquirer == "paymegate":
+        return await _process_paymegate_order(request, payment_req, idempotency_key)
 
     # ── Refuse before touching the card if we cannot deliver the crypto ─────
     signable, reason = await can_sign()
@@ -966,3 +1080,81 @@ async def get_transaction_status(tx_id: int, db: AsyncSession = Depends(get_sess
         "created_at": tx.created_at.isoformat() if tx.created_at else None,
         "completed_at": tx.completed_at.isoformat() if tx.completed_at else None,
     }
+
+
+async def _body_bytes(request: Request) -> bytes:
+    return await request.body()
+
+
+@app.post("/webhook/paymegate")
+async def paymegate_webhook(request: Request):
+    """Receive and verify PayMeGate's ``order.paid`` webhook.
+
+    PayMeGate signs the string ``"{timestamp}.{raw_body}"`` with HMAC-SHA256 and
+    sends the unpadded-base64url digest in ``X-Paymegate-Signature``, with the
+    unix second in ``X-Paymegate-Timestamp``. The signature is verified against
+    ``PAYMEGATE_WEBHOOK_SECRET`` before any state changes, so a request using
+    the action name alone cannot mark an order paid.
+
+    Returns 200 even for unrecognised events so PayMeGate stops retrying, and
+    401 for a bad signature so a misconfigured secret fails loudly.
+    """
+    body = await _body_bytes(request)
+    signature = request.headers.get("X-Paymegate-Signature")
+    timestamp = request.headers.get("X-Paymegate-Timestamp")
+    if not verify_webhook_signature(body, signature, timestamp_header=timestamp):
+        LOGGER.warning("Rejected a PayMeGate webhook with an invalid signature.")
+        raise HTTPException(status_code=401, detail="Invalid signature.")
+
+    payload = json.loads(body or b"{}")
+    event_type = payload.get("type") or payload.get("event", "")
+
+    if event_type != "order.paid" and payload.get("status") != "PAID":
+        # Acknowledge unrelated events (ping, order.created, ...) without action.
+        return {"received": True, "action": "ignored"}
+
+    order_uuid = payload.get("orderUUID")
+    external_id = payload.get("externalId")
+    status = payload.get("status")
+
+    if not order_uuid:
+        LOGGER.error("PayMeGate webhook for a paid order carried no orderUUID.")
+        raise HTTPException(status_code=422, detail="Missing orderUUID.")
+
+    async with async_session() as session:
+        q = select(Transaction).where(Transaction.paymegate_order_id == order_uuid)
+        tx = (await session.execute(q)).scalar_one_or_none()
+
+        if tx is None and external_id and external_id.startswith("libfin-"):
+            # Fall back to the id encoded in the externalId we set at creation.
+            try:
+                tx_id = int(external_id.split("-", 1)[1])
+                tx = await session.get(Transaction, tx_id)
+            except (ValueError, IndexError):
+                tx = None
+
+        if tx is None:
+            LOGGER.warning(f"PayMeGate webhook for unknown order {order_uuid}; ignored.")
+            return {"received": True, "action": "unknown_order"}
+
+        if tx.paymegate_order_id is None:
+            tx.paymegate_order_id = order_uuid
+
+        if status == "PAID":
+            try:
+                tx.transition_to(TransactionStatus.CRYPTO_SENT)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error(
+                    f"Webhook for transaction {tx.id} could not settle ({exc})."
+                )
+                raise HTTPException(status_code=409, detail="State conflict.")
+        else:
+            LOGGER.info(
+                f"Webhook for transaction {tx.id} reported status {status}; no change."
+            )
+
+        await session.commit()
+        tx_id = tx.id
+
+    LOGGER.info(f"Transaction {tx_id} settled via PayMeGate order.paid webhook.")
+    return {"received": True, "action": "settled", "transaction_id": tx_id}

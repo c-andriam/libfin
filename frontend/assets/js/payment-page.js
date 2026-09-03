@@ -216,6 +216,16 @@
       }
 
       const id = accepted.transaction_id;
+
+      // Mode PayMeGate : la passerelle a renvoyé un checkout d'hébergement.
+      // Le client paie sur la page du prestataire ; on y redirige dès que
+      // possible. L'état de la transaction reste suivi via result.html?tx=…
+      // quand il revient, car le webhook order.paid l'a marquée payée.
+      if (accepted.checkout_url) {
+        window.location.assign(accepted.checkout_url);
+        return;
+      }
+
       if (id === undefined || id === null) {
         // Ne devrait pas arriver : PaymentResponse le déclare obligatoire. Si
         // cela arrive tout de même, mieux vaut le dire que rediriger à vide.

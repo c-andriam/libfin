@@ -90,6 +90,11 @@ LEGAL_TRANSITIONS = {
         TransactionStatus.FIAT_APPROVED,
         TransactionStatus.FIAT_DECLINED,
         TransactionStatus.FIAT_UNKNOWN,
+        # PayMeGate mode: the remote order arriving as "PAID" means the fiat
+        # was collected *and* the crypto paid out by PayMeGate — nothing is
+        # left for this gateway to do, so it jumps straight to the delivered
+        # state instead of walking the authorise/capture chain.
+        TransactionStatus.CRYPTO_SENT,
     },
     # A hold is in place and nothing has been debited. Every exit is cheap.
     #
@@ -164,6 +169,12 @@ class Transaction(Base):
 
     idempotency_key = Column(String(64), unique=True, nullable=True)
     status = Column(Enum(TransactionStatus), default=TransactionStatus.PENDING, nullable=False)
+
+    #: PayMeGate's remote order handle (orderUUID) when the acquirer is
+    #: "paymegate". It is how an order.paid webhook correlates back to this row.
+    #: A unique index (not a named constraint) so Alembic autogenerate can match
+    #: it by name and never proposes a drop/recreate.
+    paymegate_order_id = Column(String(64), unique=True, index=True, nullable=True)
 
     stan = Column(String(6), nullable=True)
     rrn = Column(String(12), nullable=True)  # DE37, the acquirer's handle on the auth
@@ -356,4 +367,90 @@ class OutboxMessage(Base):
     __table_args__ = (
         # The relay's only query: unpublished, not abandoned, oldest first.
         Index("ix_outbox_pending", "published_at", "abandoned", "created_at"),
+    )
+
+
+class MerchantStatus(enum.Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    SUSPENDED = "SUSPENDED"
+
+
+class LiquidityProviderStatus(enum.Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+
+
+class Merchant(Base):
+    """A merchant (commerçant) served by the gateway.
+
+    Each merchant is an account that collects fiat on behalf of a business and
+    has the crypto delivered to its own wallet. The gateway issues a distinct
+    API key per merchant so a compromise of one does not expose the others, and
+    so volume, fees and KYC can be tracked per merchant.
+    """
+
+    __tablename__ = "merchants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    name = Column(String(128), nullable=False)
+    #: Public business identifier shown to cardholders on their statement.
+    legal_name = Column(String(128), nullable=False)
+    email = Column(String(256), nullable=False)
+    #: The wallet crypto is delivered to. Unique: two merchants cannot share a
+    #: receiving address, which would make reconciliation ambiguous.
+    target_wallet = Column(String(42), unique=True, nullable=False)
+    #: Per-merchant gateway credentials. Stored as a token only; the plaintext
+    #: key is returned once at creation and never again.
+    api_key = Column(String(64), unique=True, nullable=False)
+    status = Column(
+        Enum(MerchantStatus), default=MerchantStatus.INACTIVE, nullable=False
+    )
+    #: Fraction of the gross amount the gateway keeps, e.g 0.02 = 2%.
+    fee_rate = Column(Numeric(precision=10, scale=6), nullable=False, default=0.0)
+    kyc_verified = Column(Boolean, nullable=False, default=False)
+    kyc_document_ref = Column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index("ix_merchants_status", "status"),
+        Index("ix_merchants_email", "email"),
+    )
+
+
+class LiquidityProvider(Base):
+    """A provider of the crypto liquidity the gateway settles with.
+
+    The gateway holds a hot wallet, but who actually funds it — and on what
+    terms — is a relationship with an external counterparty. A provider has one
+    source wallet and a settlement wallet the gateway pays into, with per-unit
+    limits so a single provider cannot concentrate the whole settlement risk.
+    """
+
+    __tablename__ = "liquidity_providers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    name = Column(String(128), nullable=False)
+    contact = Column(String(256), nullable=True)
+    email = Column(String(256), nullable=False)
+    #: ERC-20 address the liquidity is sourced from.
+    source_wallet = Column(String(42), nullable=False)
+    #: Address settlement is paid into. Unique so a provider is unambiguous.
+    settlement_wallet = Column(String(42), unique=True, nullable=False)
+    status = Column(
+        Enum(LiquidityProviderStatus), default=LiquidityProviderStatus.ACTIVE, nullable=False
+    )
+    #: Maximum daily settlement this provider is trusted with, in token units.
+    daily_limit_units = Column(Numeric(precision=38, scale=0), nullable=True)
+    #: The settlement token (e.g. USDT) this provider deals in.
+    settlement_token_symbol = Column(String(12), nullable=False, default="USDT")
+
+    __table_args__ = (
+        Index("ix_liquidity_providers_status", "status"),
+        Index("ix_liquidity_providers_source_wallet", "source_wallet"),
     )

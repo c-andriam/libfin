@@ -88,11 +88,20 @@ async def clean_outbox():
     from sqlalchemy import delete
 
     from gateway.database import async_session, init_db
-    from gateway.models import OutboxMessage
+    from gateway.models import (
+        LiquidityProvider,
+        Merchant,
+        OutboxMessage,
+    )
 
     await init_db()
     async with async_session() as session:
         await session.execute(delete(OutboxMessage))
+        # The prestataire tables share the same in-memory database and their
+        # rows accumulate too — a merchant created by one test would collide on
+        # its unique wallet with the next.
+        await session.execute(delete(Merchant))
+        await session.execute(delete(LiquidityProvider))
         await session.commit()
     yield
 

@@ -2,7 +2,9 @@
  * Client de la passerelle : le seul endroit qui parle réseau.
  *
  * Contrat côté serveur — src/gateway/api.py :
- *   POST /pay                → 202 { status, message, transaction_id, fiat_amount, tx_hash, stan }
+ *   POST /pay                → 202 { status, message, transaction_id, fiat_amount, tx_hash, stan }.
+ *                              En mode PayMeGate, la réponse ajoute checkout_url
+ *                              (et order_uuid) : l'UI doit y rediriger le client.
  *   GET  /transaction/{id}   → 200 { id, status, masked_pan, stan, rrn, crypto_tx_hash, ... }
  *   GET  /health             → 200 { status, mode }   (seule route publique)
  */
