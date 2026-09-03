@@ -413,12 +413,69 @@ setup-paymegate: ## Enregistrer webhook + portefeuille chez PayMeGate (PAYMEGATE
 	@echo ""
 	@echo "  Reporter PAYMEGATE_WEBHOOK_SECRET dans $(ENV_FILE), puis : make deploy"
 
+#  Un clone neuf n'a ni fichier d'environnement, ni certificat, ni Vault
+#  initialisé — rien de tout cela n'est versionné, et pour de bonnes raisons.
+#  `bootstrap` fabrique les trois, sans rien écraser de ce qui existe déjà.
+#
+#  Il ne peut pas fabriquer les identifiants PayMeGate : ils viennent de votre
+#  compte. C'est le seul point d'arrêt, et il est explicite plutôt que découvert
+#  trois étapes plus loin sous la forme d'un préflight qui refuse.
+.PHONY: bootstrap
+bootstrap: preflight-host ## Préparer une machine neuve : env, certificats, Vault
+	@test -f $(ENV_FILE) || { echo ""; echo "  Création de $(ENV_FILE)…"; $(MAKE) --no-print-directory env-prod; }
+	@test -f nginx/ssl/server.crt || { echo "  Génération d'un certificat TLS local…"; ./scripts/gen_certs.sh $(or $(CN),localhost) >/dev/null; echo "  ✔ nginx/ssl/"; }
+#  VAULT_TOKEN est exclu : `vault-ensure` l'écrit lui-même au premier
+#  démarrage. Le réclamer ici enverrait chercher une valeur qui arrive seule.
+#  Le filtre suit celui de preflight_check.sh, qui fait autorité : seul le
+#  bloc de l'acquéreur en service est exigé. Ce contrôle-ci n'existe que pour
+#  le dire tôt, avant une construction de plusieurs minutes.
+	@remaining=$$(grep -nE '^[A-Z_]+=.*REPLACE_ME' $(ENV_FILE) 2>/dev/null | grep -vE "$$(grep -q '^ACQUIRER=paymegate' $(ENV_FILE) && echo ':(BANK_|ACQUIRER_|WEB3_)' || echo ':PAYMEGATE_')" | grep -v ':VAULT_TOKEN' | wc -l); \
+	if [ "$$remaining" -gt 0 ]; then \
+	  echo ""; \
+	  echo "  ──────────────────────────────────────────────────────────"; \
+	  echo "   $$remaining valeur(s) restent à renseigner dans $(ENV_FILE) :"; \
+	  echo ""; \
+	  grep -nE '^[A-Z_]+=.*REPLACE_ME' $(ENV_FILE) | grep -vE "$$(grep -q '^ACQUIRER=paymegate' $(ENV_FILE) && echo ':(BANK_|ACQUIRER_|WEB3_)' || echo ':PAYMEGATE_')" | grep -v ':VAULT_TOKEN' | sed 's/^/     /'; \
+	  echo ""; \
+	  echo "   Pour un encaissement par PayMeGate, il faut ACQUIRER=paymegate"; \
+	  echo "   et les trois PAYMEGATE_*. Le webhook et son secret s'obtiennent"; \
+	  echo "   avec :  make setup-paymegate WALLET=0x…"; \
+	  echo ""; \
+	  echo "   Puis relancer : make deploy"; \
+	  echo "  ──────────────────────────────────────────────────────────"; \
+	  exit 1; \
+	fi
+	@echo "  ✔ Configuration complète."
+
+#  Vault est amorcé après le démarrage des services de données et avant les
+#  migrations : le script s'y connecte par `podman exec`, donc le conteneur
+#  doit tourner, et l'API a besoin du jeton avant de démarrer.
+.PHONY: vault-ensure
+vault-ensure: ## Initialiser ou desceller Vault selon son état
+	@out=$$(podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod vault status 2>/dev/null || true); \
+	if echo "$$out" | grep -q 'Initialized.*true'; then \
+	  if echo "$$out" | grep -q 'Sealed.*true'; then \
+	    echo "  Vault est scellé — descellement…"; $(MAKE) --no-print-directory prod-vault-unseal; \
+	  else echo "  ✔ Vault déjà ouvert."; fi; \
+	else echo "  Premier démarrage de Vault — initialisation…"; $(MAKE) --no-print-directory prod-vault-bootstrap; fi
+
 .PHONY: deploy
-deploy: preflight-host prod-full ## ⭐ Tout monter : build → migrations → services → tunnel → vérification
+deploy: bootstrap ## ⭐ Tout monter : env → certificats → Vault → build → migrations → services → tunnel
+	#  Vault d'abord : il écrit VAULT_TOKEN dans le fichier d'environnement,
+	#  et le préflight le lit. L'inverse bloquait sur une valeur que l'étape
+	#  suivante allait produire.
+	$(PROD_COMPOSE) up -d gateway-postgres gateway-redis gateway-vault
+	@echo "  Attente des services de données…"; sleep 12
+	@$(MAKE) --no-print-directory vault-ensure
+	@$(MAKE) --no-print-directory prod-preflight
+	@$(MAKE) --no-print-directory prod-build
+	@$(MAKE) --no-print-directory prod-migrate
+	$(PROD_COMPOSE) up -d
+	@echo "  Attente de Nginx…"
+	@i=0; until curl -skf -o /dev/null $(PROD_URL)/health; do i=$$((i+1)); test $$i -lt 60 || { echo "  ✘ Rien sur $(PROD_URL) — make prod-logs"; exit 1; }; sleep 2; done
 	@$(MAKE) --no-print-directory tunnel-start
-	@echo ""
-	@echo "  Attente de la propagation du nom public..."
-	@i=0; until curl -sf -o /dev/null --max-time 20 https://$(TUNNEL_HOSTNAME)/health; do 	    i=$$((i+1)); 	    test $$i -lt 20 || { echo "  ✘ https://$(TUNNEL_HOSTNAME) ne répond pas — make tunnel-status"; exit 1; }; 	    sleep 6; 	done
+	@echo ""; echo "  Attente de la propagation du nom public…"
+	@i=0; until curl -sf -o /dev/null --max-time 20 https://$(TUNNEL_HOSTNAME)/health; do i=$$((i+1)); test $$i -lt 20 || { echo "  ✘ https://$(TUNNEL_HOSTNAME) ne répond pas — make tunnel-status"; exit 1; }; sleep 6; done
 	@$(MAKE) --no-print-directory deploy-verify
 
 .PHONY: deploy-verify
