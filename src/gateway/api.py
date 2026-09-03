@@ -165,7 +165,14 @@ app.add_middleware(
 app.include_router(prestataires_router)
 
 #: Endpoints reachable without an API key. Deliberately short.
-PUBLIC_PATHS = {"/health"}
+#:
+#: The PayMeGate webhook belongs here for a reason that is easy to get backwards:
+#: it is not unauthenticated, it is authenticated *differently*. PayMeGate signs
+#: each delivery with the shared webhook secret and has no way to know our API
+#: key, so demanding the key would reject every genuine callback — and since the
+#: webhook is the only channel by which a payment's outcome ever arrives, the
+#: whole integration would sit silent with nothing in the logs to explain it.
+PUBLIC_PATHS = {"/health", "/webhook/paymegate"}
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
 
@@ -262,11 +269,42 @@ class PaymentRequest(BaseModel):
         pattern=r"^[A-Za-z]{3}$",
         description="ISO 4217 currency of the amount, e.g. USD, EUR, GBP",
     )
-    target_wallet: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+    #: Optional only because a link supplies it instead. The model validator
+    #: below refuses a request that carries neither, so the direct path stays
+    #: exactly as strict as it was.
+    target_wallet: Optional[str] = Field(default=None, pattern=r"^0x[a-fA-F0-9]{40}$")
     #: Optional customer contact forwarded to PayMeGate (required there for the
     #: order). Defaults to a placeholder; the hosted checkout does not echo it to
     #: the payer.
     customer_email: str = Field(default="", max_length=256)
+
+    @model_validator(mode="after")
+    def one_form_or_the_other(self):
+        """A request states an order, or names one by link — never both.
+
+        Accepting both would leave it ambiguous which one governs, and every
+        such ambiguity is eventually resolved in the attacker's favour: a payer
+        would present a link for 300 and an amount of 3. Refusing outright is
+        the only reading that cannot be gamed.
+
+        This guard and the Optional above are a pair. Losing either one — as a
+        merge once did — silently reopens the hole or breaks link payments
+        entirely, which is why test_link_payments.py now asserts both.
+        """
+        if self.link:
+            stated = [n for n in ("amount", "target_wallet") if getattr(self, n) is not None]
+            if stated:
+                raise ValueError(
+                    "Send either 'link' or the order fields, not both "
+                    f"(got 'link' with {', '.join(sorted(stated))})."
+                )
+        else:
+            missing = [n for n in ("amount", "target_wallet") if getattr(self, n) is None]
+            if missing:
+                raise ValueError(
+                    f"Missing {', '.join(sorted(missing))}; send them, or a 'link' instead."
+                )
+        return self
 
     @field_validator("currency")
     @classmethod

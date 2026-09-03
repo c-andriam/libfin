@@ -437,9 +437,14 @@ fi
 # Vault with mlock disabled may be swapped to disk.
 if [[ "${VAULT_DISABLE_MLOCK:-true}" == "true" ]]; then
     if command -v swapon >/dev/null 2>&1 && [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
-        warn "VAULT_DISABLE_MLOCK=true and this host has swap enabled: Vault's memory, \
-including the hot wallet key, can be written to disk. Disable or encrypt swap, or run \
-rootful with VAULT_DISABLE_MLOCK=false."
+        # A blocker, not a warning. What sits in that memory is the key that
+        # signs transfers: swapped to disk it outlives the process, survives a
+        # reboot, and is readable by anyone who later gets the disk. A warning
+        # invites someone to note it and carry on, which is the wrong answer
+        # for a credential that can move money.
+        block "VAULT_DISABLE_MLOCK=true and this host has swap enabled: Vault's memory, \
+including the hot wallet key, can be written to disk and survive the process. Turn swap \
+off (swapoff -a), encrypt it, or run Vault rootful with VAULT_DISABLE_MLOCK=false."
     else
         pass "Vault memory locking is off, but the host has no swap."
     fi

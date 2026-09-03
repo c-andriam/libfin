@@ -173,6 +173,34 @@ class PayMeGateClient:
         )
         return data.get("data", data)
 
+    async def set_webhook(self, url: str, events: list[str] | None = None) -> dict:
+        """Tell PayMeGate where to deliver events, and get the signing secret.
+
+        This is the step that produces ``PAYMEGATE_WEBHOOK_SECRET``. PayMeGate
+        returns the secret **once**, at configuration time, and never again — so
+        the value in the response must be copied into the environment before the
+        process that made this call exits. Losing it means configuring the
+        webhook again, which rotates the secret and breaks verification until
+        the new one is deployed.
+
+        The URL must be publicly reachable over HTTPS: PayMeGate calls it, not
+        the other way round. Behind NAT that means a tunnel or a public host —
+        an address that only resolves on your own network silently receives
+        nothing, and the integration then looks broken for a reason no log
+        explains.
+        """
+        if not url.startswith("https://"):
+            # Refused rather than warned: the secret is delivered against this
+            # URL, and an http:// endpoint would carry it in clear text.
+            raise PayMeGateError(
+                f"The webhook URL must be https, got {url!r}."
+            )
+        payload: dict = {"url": url}
+        if events:
+            payload["events"] = events
+        data = await self._request("PUT", "/v1/webhook", json=payload)
+        return data.get("data", data)
+
     async def health(self) -> dict:
         """Cheap reachability probe (the API has no public liveness route)."""
         try:
@@ -229,6 +257,11 @@ def verify_webhook_signature(
     if abs(int(timestamp_header) - int(time.time())) > max_age_sec:
         return False
 
-    message = f"{timestamp_header.strip()}.{body.decode('utf-8', 'surrogateescape')}".encode()
+    # Assembled from bytes. Decoding the body and re-encoding it round-trips
+    # through str, and a body that is not valid UTF-8 then raises on the way
+    # back — an unhandled 500 on an endpoint anyone on the internet can reach,
+    # where the only correct answer is a quiet False. The signature is computed
+    # over bytes anyway; turning them into text first was never necessary.
+    message = timestamp_header.strip().encode("ascii") + b"." + body
     actual = hmac.new(secret_value.encode(), message, "sha256").digest()
     return hmac.compare_digest(actual, expected)

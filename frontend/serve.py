@@ -60,6 +60,14 @@ RELAYED = (
     ("GET", re.compile(r"^/links$")),
     ("PATCH", re.compile(r"^/links/\d+$")),
     ("DELETE", re.compile(r"^/links/\d+$")),
+    # Merchants and liquidity providers — configuration, so UNKEYED like the
+    # console. Relayed here so the development path and the Nginx path agree;
+    # a route that works through one and 404s through the other is discovered
+    # at the worst moment.
+    ("GET", re.compile(r"^/prestataires(/.*)?$")),
+    ("POST", re.compile(r"^/prestataires(/.*)?$")),
+    ("PATCH", re.compile(r"^/prestataires(/.*)?$")),
+    ("DELETE", re.compile(r"^/prestataires(/.*)?$")),
 )
 
 #: Client headers worth carrying through. Everything else — cookies above all —
@@ -120,7 +128,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     #: Routes the relay forwards but never authenticates on the caller's behalf.
-    MANAGEMENT = re.compile(r"^/links(/\d+)?$")
+    MANAGEMENT = re.compile(r"^/(links(/\d+)?|prestataires(/.*)?)$")
 
     @classmethod
     def _is_management(cls, path):

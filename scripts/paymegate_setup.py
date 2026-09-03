@@ -22,6 +22,7 @@ PayMeGate; it does not need Postgres, Redis or a chain.
 """
 
 import argparse
+import asyncio
 import pathlib
 import re
 import sys
@@ -58,13 +59,28 @@ def _format_wallet(payload: dict) -> None:
         print(f"  {wallets}")
 
 
+def _run(coro):
+    """Drive one client coroutine to completion.
+
+    Every PayMeGateClient method is ``async``. Calling one without awaiting it
+    builds a coroutine and discards it: nothing is sent, no exception is raised,
+    and the caller goes on to print a success message for a request that never
+    left the process. That is exactly what this script did until now — the
+    payout wallet was never configured, and it said it was.
+
+    A command-line tool has no event loop of its own, so one is created per call
+    rather than making this whole script async for three short commands.
+    """
+    return asyncio.run(coro)
+
+
 def cmd_show(args) -> int:
     """Print what PayMeGate currently holds for our wallet."""
     from gateway.paymegate import PayMeGateClient
 
     client = PayMeGateClient()
     try:
-        data = client._request("GET", "/v1/wallet")
+        data = _run(client._request("GET", "/v1/wallet"))
     except Exception as exc:  # noqa: BLE001
         print(f"  Could not read the wallet: {exc}", file=sys.stderr)
         return 1
@@ -108,13 +124,53 @@ def cmd_wallet(args) -> int:
 
     client = PayMeGateClient()
     try:
-        data = client.update_wallet(**kwargs, include_crypto=True)
+        data = _run(client.update_wallet(**kwargs, include_crypto=True))
     except Exception as exc:  # noqa: BLE001
         print(f"  PayMeGate rejected the wallet update: {exc}", file=sys.stderr)
         return 1
 
     print("  Wallet updated on PayMeGate:")
     _format_wallet(data)
+    return 0
+
+
+def cmd_webhook(args) -> int:
+    """Register the callback URL and print the signing secret it returns.
+
+    PayMeGate shows the secret once. It is printed here and nowhere else: not
+    logged, not written to a file, because a secret in a log is a secret you
+    have to go and delete afterwards.
+    """
+    from gateway.paymegate import PayMeGateClient
+
+    print(f"  Registering {args.url}")
+    print("  PayMeGate will POST order.paid events there, signed with the")
+    print("  secret it returns below. That URL must already be reachable")
+    print("  from the public internet — PayMeGate calls you, not the reverse.")
+    confirm = input("  Type 'yes' to confirm: ")
+    if confirm.strip().lower() != "yes":
+        print("  Aborted.")
+        return 1
+
+    client = PayMeGateClient()
+    try:
+        data = _run(client.set_webhook(args.url))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  PayMeGate rejected the webhook update: {exc}", file=sys.stderr)
+        return 1
+
+    secret = data.get("secret") or data.get("signingSecret") or ""
+    print()
+    print("  Webhook registered.")
+    if secret:
+        print(f"  PAYMEGATE_WEBHOOK_SECRET={secret}")
+        print()
+        print("  Copy that into your environment now. PayMeGate does not show")
+        print("  it again; registering the webhook a second time issues a new")
+        print("  one and breaks verification until the new value is deployed.")
+    else:
+        print("  No secret in the response — read it from the PayMeGate")
+        print(f"  dashboard. Raw response: {data}")
     return 0
 
 
@@ -131,6 +187,10 @@ def main() -> int:
         help="trc20 for TRON USDT, evm for ERC-20 USDC/USDT",
     )
     p_wallet.set_defaults(func=cmd_wallet)
+
+    p_hook = sub.add_parser("webhook", help="register the callback URL and get its secret")
+    p_hook.add_argument("url", help="public HTTPS URL, e.g. https://pay.example.com/webhook/paymegate")
+    p_hook.set_defaults(func=cmd_webhook)
 
     p_show = sub.add_parser("show", help="print the current payout configuration")
     p_show.set_defaults(func=cmd_show)
