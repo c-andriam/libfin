@@ -169,6 +169,37 @@ class Settings:
         #: (still common on mainframe-backed acquirers).
         self.acquirer_encoding: str = _env("ACQUIRER_ENCODING", "latin_1")
 
+        # ── Payment route ─────────────────────────────────────────────────────
+        # Which backend serves the fiat leg of a payment.
+        #   iso8583    an ISO 8583 acquirer link (BANK_* / ACQUIRER_* below) —
+        #              you hold the hot wallet and settle the crypto yourself.
+        #   paymegate  PayMeGate's hosted checkout (PAYMEGATE_* below) — the
+        #              customer pays on PayMeGate's page and PayMeGate settles
+        #              the crypto straight to your configured wallet.
+        self.acquirer: str = _env("ACQUIRER", "iso8583").lower()
+        if self.acquirer not in ("iso8583", "paymegate"):
+            raise ConfigError(
+                f"ACQUIRER must be 'iso8583' or 'paymegate', got {self.acquirer!r}"
+            )
+
+        # ── PayMeGate ─────────────────────────────────────────────────────────
+        # https://api.paymegate.com — live merchant API key (e.g. pmg_live_…).
+        # Keep it secret: read from the environment only, never committed.
+        self.paymegate_base_url: str = _env(
+            "PAYMEGATE_BASE_URL", "https://api.paymegate.com"
+        ).rstrip("/")
+        self.paymegate_api_key: str = _env("PAYMEGATE_API_KEY")
+        #: Secret used to verify signed webhooks. Set via PUT /v1/webhook; the
+        #: value is returned once at configuration time. Keep it secret too.
+        self.paymegate_webhook_secret: str = _env("PAYMEGATE_WEBHOOK_SECRET")
+        #: Payment methods exposed on the hosted checkout. ["*"] snapshots every
+        #: enabled method; ["crypto"] restricts to crypto-payout orders.
+        self.paymegate_payment_methods: str = _env(
+            "PAYMEGATE_PAYMENT_METHODS", "*"
+        ).strip()
+        #: Where the customer returns after paying on the hosted checkout.
+        self.paymegate_return_url: str = _env("PAYMEGATE_RETURN_URL")
+
         # ── Web3 ────────────────────────────────────────────────────────────
         rpc_urls = [
             _env("WEB3_RPC_URL", "http://127.0.0.1:8545"),
@@ -365,6 +396,25 @@ class Settings:
         require(self.redis_url, "REDIS_URL")
         require(self.vault_addr, "VAULT_ADDR")
         require(self.vault_token, "VAULT_TOKEN")
+
+        if self.acquirer == "paymegate":
+            require(
+                self.paymegate_api_key,
+                "PAYMEGATE_API_KEY",
+                "Your merchant key, starts with pmg_live_.",
+            )
+            require(
+                self.paymegate_webhook_secret,
+                "PAYMEGATE_WEBHOOK_SECRET",
+                "Returned once when you configure PUT /v1/webhook.",
+            )
+            require(
+                self.paymegate_return_url,
+                "PAYMEGATE_RETURN_URL",
+                "Public HTTPS destination the customer returns to after paying.",
+            )
+            return problems
+
         require(self.bank_host, "BANK_HOST", "Point it at your acquirer.")
         require(self.acquirer_terminal_id, "ACQUIRER_TERMINAL_ID", "Supplied by your acquirer.")
         require(self.acquirer_merchant_id, "ACQUIRER_MERCHANT_ID", "Supplied by your acquirer.")

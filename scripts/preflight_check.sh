@@ -65,6 +65,11 @@ set +a
 section "Unfilled values"
 
 PLACEHOLDERS="$(grep -nE '^[A-Z_]+=.*REPLACE_ME' "${ENV_FILE}" || true)"
+# When the fiat leg is the ISO 8583 link, the PayMeGate block is inert: its
+# REPLACE_ME placeholders would otherwise block a launch that does not use it.
+if [[ "${ACQUIRER:-iso8583}" != "paymegate" ]]; then
+    PLACEHOLDERS="$(printf '%s\n' "${PLACEHOLDERS}" | grep -vE '^[0-9]+:PAYMEGATE_' || true)"
+fi
 if [[ -n "${PLACEHOLDERS}" ]]; then
     while IFS= read -r line; do
         block "Still a placeholder: ${line%%=*}"

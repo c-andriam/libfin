@@ -52,6 +52,7 @@ gateway = [
   "redis",
   "hvac",
   "slowapi",
+  "httpx",
   # Encrypts the card number staged for a possible reversal.
   "cryptography >= 44"
 ]
