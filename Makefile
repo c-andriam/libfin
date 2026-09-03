@@ -254,13 +254,14 @@ sim: certs sim-build ## Lancer la simulation complète (build + up + migration +
 	@$(SIM_COMPOSE) logs gateway-token-deployer 2>/dev/null | tail -5 || true
 	@echo ""
 	@echo "  ✔ Simulation lancée."
-	@echo "    API      : https://localhost:8443  (certificat auto-signé → curl -k)"
-	@echo "    Clé API  : voir GATEWAY_API_KEY dans .env.sim"
-	@echo "    Cartes   : 4111111111111111 approuvée · 4000000000000002 refusée"
-	@echo "               4000000000000028 sans réponse · 4000000000000036 reversal refusé"
+	@echo "    Formulaire : https://localhost:8443/   (certificat auto-signé)"
+	@echo "    API        : même origine — /health, /pay, /transaction/<id>"
+	@echo "    Clé API    : posée par Nginx ; en direct, GATEWAY_API_KEY de .env.sim"
+	@echo "    Cartes     : 4111111111111111 approuvée · 4000000000000002 refusée"
+	@echo "                 4000000000000028 sans réponse · 4000000000000036 reversal refusé"
 	@echo ""
-	@echo "    Tester   : make sim-pay"
-	@echo "    Vérifier : make sim-status"
+	@echo "    Tester     : make sim-pay"
+	@echo "    Vérifier   : make sim-status"
 
 .PHONY: sim-up
 sim-up: ## Démarrer la simulation sans reconstruire
@@ -304,6 +305,11 @@ sim-decline: ## Tester le refus bancaire (aucun crypto ne doit partir)
 .PHONY: sim-reconcile
 sim-reconcile: ## Lancer la réconciliation à blanc dans la simulation
 	$(SIM_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
+
+.PHONY: sim-connect
+sim-connect: ## Créer une session temporaire pour la console des liens (make sim-connect [TTL=14400], 240min par défaut)
+	$(SIM_COMPOSE) exec -T gateway-api python /app/scripts/connect.py \
+		--ttl $(or $(TTL),14400) --base-url https://localhost:8443
 
 .PHONY: sim-reset
 sim-reset: ## Repartir de zéro (supprime base ET file d'attente)
@@ -385,15 +391,28 @@ test-robustness: test-concurrency test-chaos test-testnet ## Les trois d'affilé
 # ──────────────────────────────────────────────────────────────
 #  PRODUCTION
 # ──────────────────────────────────────────────────────────────
-PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file .env.prod
+# .env.prod est suivi par git, dans un dépôt public : c'est un modèle, il ne
+# doit porter aucun secret. Le lancement réel pointe sur .env.prod.local, qui
+# n'est pas suivi et que `make env-prod` génère.
+#
+# GATEWAY_ENV_FILE est exporté parce que podman-compose.prod.yml s'en sert pour
+# le `env_file:` des conteneurs applicatifs : sans lui, l'API lirait le modèle
+# et démarrerait avec des placeholders.
+ENV_FILE ?= .env.prod.local
+export GATEWAY_ENV_FILE := $(ENV_FILE)
+PROD_COMPOSE := podman-compose -f podman-compose.prod.yml --env-file $(ENV_FILE)
 
 .PHONY: prod-build
 prod-build: ## Construire l'image de production
 	podman build -t gateway:prod -f Containerfile.prod .
 
+.PHONY: env-prod
+env-prod: ## Créer .env.prod : secrets générés, le reste listé
+	./scripts/init_env_prod.sh
+
 .PHONY: prod-preflight
 prod-preflight: ## Vérifier que tout est prêt (bloque si non)
-	./scripts/preflight_check.sh
+	ENV_FILE=$(ENV_FILE) ./scripts/preflight_check.sh
 
 .PHONY: prod-migrate
 prod-migrate: ## Appliquer les migrations de schéma (Alembic)
@@ -423,9 +442,76 @@ prod: prod-preflight prod-build ## Lancer la production (preflight → build →
 	$(MAKE) prod-migrate
 	$(PROD_COMPOSE) up -d
 	@echo ""
-	@echo "  ✔ Production lancée."
+	@echo "  ✔ Production lancée (passerelle + formulaire, même origine TLS)."
 	@echo "    Si Vault vient de redémarrer : make prod-vault-unseal"
 	@echo "    Vérifier l'état             : make prod-status"
+	@echo "    Tout vérifier d'un coup     : make prod-verify"
+
+# Le port publié par Nginx. HTTPS_PORT vaut 443 par défaut ; en rootless,
+# .env.prod le remonte au-dessus de 1024, et l'URL de vérification doit suivre.
+PROD_PORT ?= $(shell sed -n 's/^HTTPS_PORT=//p' $(ENV_FILE) 2>/dev/null | tr -d '\r' | tail -1 | grep . || echo 443)
+PROD_URL  ?= https://localhost:$(PROD_PORT)
+
+# ⭐ La commande unique : tout le back, tout le front, une seule origine TLS.
+#
+# `prod-verify` est appelé depuis la recette, non déclaré en prérequis : un
+# `make -j` lancerait les deux de front et vérifierait une pile qui n'est pas
+# encore debout.
+.PHONY: prod-full
+prod-full: prod ## ⭐ Tout lancer : passerelle + formulaire sur une seule origine TLS
+	@echo ""
+	@echo "  Attente de Nginx (la passerelle doit d'abord être saine)..."
+	@i=0; until curl -skf -o /dev/null $(PROD_URL)/health; do i=$$((i+1)); test $$i -lt 60 || { echo "  ✘ Rien sur $(PROD_URL) après deux minutes — make prod-logs"; exit 1; }; sleep 2; done
+	@$(MAKE) --no-print-directory prod-verify
+	@echo ""
+	@echo "  ══════════════════════════════════════════════════════════"
+	@echo "   Le tunnel de paiement est en ligne."
+	@echo ""
+	@echo "   Formulaire : $(PROD_URL)/"
+	@echo "   Étape 2    : $(PROD_URL)/payment.html"
+	@echo "   Étape 3    : $(PROD_URL)/result.html?tx=<id>"
+	@echo ""
+	@echo "   Le navigateur ne voit qu'une origine : Nginx sert les pages et"
+	@echo "   relaie /health, /pay et /transaction/<id> vers la passerelle en"
+	@echo "   y ajoutant X-API-Key. Aucune clé ni URL à saisir dans la page —"
+	@echo "   le panneau « Connexion » se masque de lui-même."
+	@echo "  ══════════════════════════════════════════════════════════"
+	@echo ""
+	@echo "   Si Vault vient de redémarrer : make prod-vault-unseal"
+	@echo "   Logs : make prod-logs · Arrêt : make prod-down"
+
+#  $(call probe,<code attendu>,<chemin>,<libellé>)
+#
+#  « probe » et non « check » : `check` est déjà une cible de ce fichier,
+#  et deux sens pour un même mot se paient à la relecture.
+#
+#  -k parce que le certificat est auto-signé tant qu'aucun vrai n'est installé.
+#  Avec un certificat émis par une AC, le retirer : une vérification qui ne
+#  vérifie rien vaut moins que pas de vérification du tout.
+#
+#  Pas de virgule dans le libellé : $(call) découpe ses arguments dessus.
+probe = code=$$(curl -sk -o /dev/null -w '%{http_code}' $(PROD_URL)$(2) 2>/dev/null || echo 000); printf '  %-5s %-24s %s\n' "$$code" '$(2)' '$(3)'; test "$$code" = '$(1)' || { echo '  ✘ attendu $(1) sur $(2)'; exit 1; }
+
+.PHONY: prod-verify
+prod-verify: ## Vérifier que les deux moitiés répondent sur la même origine
+	@echo ""
+	@echo "  Vérification de $(PROD_URL)"
+	@echo "  ──────────────────────────────────────────────────"
+	@$(call probe,200,/health,passerelle)
+	@$(call probe,200,/,formulaire — étape 1)
+	@$(call probe,200,/payment.html,formulaire — étape 2)
+	@$(call probe,200,/result.html,formulaire — étape 3)
+	@$(call probe,200,/assets/css/styles.css,feuille de style)
+	@$(call probe,200,/assets/js/api.js,client de la passerelle)
+	@# Le montage porte aussi README.md, CHECKLIST.md, ROADMAP.md et serve.py,
+	@# et /health/ready nomme un à un les composants de l'infrastructure. La
+	@# liste blanche de Nginx doit refuser les uns comme l'autre : un 200 ici
+	@# veut dire qu'elle a sauté.
+	@$(call probe,404,/README.md,documentation — hors liste)
+	@$(call probe,404,/serve.py,serve.py — hors liste)
+	@$(call probe,404,/health/ready,readiness — hors liste)
+	@echo ""
+	@echo "  ✔ Formulaire et passerelle répondent sur la même origine."
 
 .PHONY: prod-down
 prod-down: ## Arrêter la production (volumes conservés)
@@ -440,6 +526,19 @@ prod-status: ## État des conteneurs et santé applicative
 	$(PROD_COMPOSE) ps
 	@echo ""
 	@$(PROD_COMPOSE) exec -T gateway-api curl -sf http://127.0.0.1:8000/health || echo "  API injoignable"
+
+# Le premier démarrage a un ordre non évident : le preflight bloque sur
+# VAULT_TOKEN, mais ce token n'existe qu'une fois Vault initialisé — et Vault
+# fait partie de la pile que le preflight garde. Cette cible démarre Vault
+# seul, sans preflight : aucun conteneur applicatif, rien qui puisse toucher
+# une carte.
+.PHONY: prod-certbot
+prod-certbot: ## Certificat TLS reel : make prod-certbot DOMAIN=... EMAIL=...
+	./scripts/certbot_issue.sh
+
+.PHONY: prod-vault-bootstrap
+prod-vault-bootstrap: ## Premier démarrage de Vault : init + descellement + token dans .env.prod
+	./scripts/vault_bootstrap_prod.sh
 
 .PHONY: prod-vault-init
 prod-vault-init: ## Initialiser Vault en production (une seule fois)
@@ -486,6 +585,15 @@ reconcile: ## Réconcilier la base et la chaîne (production)
 .PHONY: reconcile-dry
 reconcile-dry: ## Réconciliation en lecture seule (production)
 	$(PROD_COMPOSE) exec gateway-api python /app/scripts/reconciliation_cron.py --dry-run
+
+# La console des liens (/links) n'hérite jamais de la clé injectée par Nginx —
+# volontairement, voir nginx.conf. `connect` en donne un accès temporaire sans
+# jamais faire circuler GATEWAY_API_KEY : le jeton expire de lui-même et ne
+# peut être créé que d'ici, jamais depuis une requête HTTP.
+.PHONY: connect
+connect: ## Créer une session temporaire pour la console des liens (make connect [TTL=14400], 240min par défaut)
+	$(PROD_COMPOSE) exec -T gateway-api python /app/scripts/connect.py \
+		--ttl $(or $(TTL),14400) --base-url $(PROD_URL)
 
 .PHONY: security-audit
 security-audit: ## Analyse statique de sécurité et audit des dépendances

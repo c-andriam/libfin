@@ -81,7 +81,8 @@ C'est la seule configuration qui mène un paiement jusqu'à `FIAT_CAPTURED`.
 
 ### Production
 
-- [ ] **Nginx** en terminaison TLS, servant aussi les fichiers statiques
+- [x] **Nginx** en terminaison TLS, servant aussi les fichiers statiques
+      — fait : `make prod-full`, `make sim`
 - [ ] **PostgreSQL**, **Redis**, **Vault** — pas leurs doublures
 - [ ] Un **nœud RPC** et un portefeuille approvisionné
 - [ ] Un **acquéreur** joignable en TLS mutuel
@@ -180,7 +181,13 @@ paquets installés.
       actuel, que les navigateurs ignorent souvent
 - [ ] **Délai d'inactivité** sur la page carte, qui vide les champs
 - [ ] **Retirer le panneau « Connexion »** — seul chemin qui met une clé d'API
-      dans un navigateur *(coût : plus de mode deux-origines)*
+      dans un navigateur *(coût : plus de mode deux-origines)*. Partiellement
+      traité pour `links.html` : `make connect` (`scripts/connect.py`) émet
+      désormais une session temporaire à durée de vie limitée, acceptée sur
+      `/links` à la place de la clé permanente — voir `MANAGEMENT_PATHS` dans
+      `gateway/api.py` et `consumeConnectToken()` dans `assets/js/boot.js`. La clé
+      permanente reste saisissable dans le panneau pour le mode deux-origines ;
+      ce n'est retiré que pour l'usage courant de la console.
 
 ### Backend
 
@@ -208,8 +215,9 @@ paquets installés.
 - [ ] `AUTO_CREATE_SCHEMA=false`, migrations par Alembic
 - [ ] `GATEWAY_API_KEY` généré (`openssl rand -hex 32`), hors du dépôt
 - [ ] Secrets dans Vault descellé, pas dans l'environnement
-- [ ] Nginx sert les fichiers statiques **et** injecte la clé (bloc dans le
-      README) — le frontend n'a alors plus aucune configuration
+- [x] Nginx sert les fichiers statiques **et** injecte la clé — fait, dans
+      [nginx.conf](../nginx/nginx.conf) : le frontend n'a plus aucune
+      configuration, et `make prod-verify` le vérifie à chaque lancement
 - [ ] Journaux : vérifier qu'aucun PAN complet n'y apparaît jamais
 - [ ] Supervision de `REVERSAL_FAILED` et `FIAT_UNKNOWN` : ces deux états
       appellent un humain

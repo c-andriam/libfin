@@ -5,17 +5,17 @@ import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,10 +23,11 @@ from gateway.acquirer import AcquirerService, AuthorizationTimeout
 from gateway.action_codes import describe, is_approved
 from gateway.circuit_breaker import web3_circuit_breaker
 from gateway.config import settings
+from gateway import connect_sessions
 from gateway.currency import UnsupportedCurrency, get as get_currency
 from gateway.database import async_session, engine, get_session, init_db
 from gateway.exchange_rate import RateUnavailable, apply_spread, build_rate_source
-from gateway.models import Transaction, TransactionStatus
+from gateway.models import PaymentLink, Transaction, TransactionStatus, utcnow
 from gateway.outbox import enqueue, try_publish_now
 from gateway.observability import (
     configure_logging,
@@ -168,6 +169,15 @@ PUBLIC_PATHS = {"/health"}
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
 
+#: The link-management console: list, enable/disable, delete. Nginx and
+#: frontend/serve.py both single this group out to never inherit the relay's
+#: injected key, because it discloses destination wallets and can destroy
+#: links — see the matching MANAGEMENT pattern in frontend/serve.py. It is the
+#: one place a `make connect` session (gateway.connect_sessions) is honoured
+#: instead of the permanent key; every other route accepts the permanent key
+#: only.
+MANAGEMENT_PATHS = re.compile(r"^/links(/\d+)?$")
+
 
 @app.middleware("http")
 async def attach_correlation_id(request: Request, call_next):
@@ -203,9 +213,13 @@ async def authenticate_api_key(request: Request, call_next):
         return await call_next(request)
 
     provided = request.headers.get("X-API-Key", "")
-    if not secrets.compare_digest(provided, settings.api_key):
-        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key."})
-    return await call_next(request)
+    if secrets.compare_digest(provided, settings.api_key):
+        return await call_next(request)
+
+    if provided and MANAGEMENT_PATHS.match(request.url.path) and await connect_sessions.verify(provided):
+        return await call_next(request)
+
+    return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key."})
 
 
 @app.exception_handler(Exception)
@@ -221,10 +235,26 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 
 class PaymentRequest(BaseModel):
+    """Card data plus an order — either stated outright, or named by a link.
+
+    The two forms exist for two callers. A merchant driving the API directly
+    states the order. A payer following a 2D link sends only ``link``: the
+    amount and the destination wallet are read from the row that link names,
+    so nothing the payer's browser sends can alter either. That is the whole
+    point of the token — the order is not in the payer's hands to change.
+    """
+
     pan: str = Field(..., pattern=r"^\d{13,19}$", description="Primary Account Number")
     expiry: str = Field(..., pattern=r"^\d{4}$", description="Expiry date, YYMM")
     cvv: str = Field(..., pattern=r"^\d{3,4}$", description="Card Verification Value")
-    amount: Decimal = Field(..., gt=0, decimal_places=2, description="Fiat amount")
+
+    #: A payment-link token. When present the order fields must be absent.
+    link: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{16,64}$")
+
+    #: Optional only because a link supplies them instead. The validator below
+    #: refuses a request that carries neither, so the direct path is as strict
+    #: as it was.
+    amount: Optional[Decimal] = Field(default=None, gt=0, decimal_places=2)
     #: ISO 4217 alphabetic. Explicit rather than assumed: an amount without a
     #: currency is ambiguous, and the ambiguity is only ever resolved wrongly.
     currency: str = Field(
@@ -248,7 +278,11 @@ class PaymentRequest(BaseModel):
 
     @field_validator("amount")
     @classmethod
-    def within_limits(cls, value: Decimal) -> Decimal:
+    def within_limits(cls, value: Optional[Decimal]) -> Optional[Decimal]:
+        # None is legitimate here: a link-borne request has no amount of its
+        # own, and the amount it resolves to was checked when the link was made.
+        if value is None:
+            return value
         if value < settings.amount_min or value > settings.amount_max:
             raise ValueError(
                 f"Amount must be between {settings.amount_min} and {settings.amount_max}."
@@ -557,6 +591,173 @@ async def _fail_transaction(tx_id: int, status: TransactionStatus, reason: str) 
             await session.commit()
 
 
+class LinkRequest(BaseModel):
+    """An order a merchant wants someone else to pay."""
+
+    amount: Decimal = Field(..., gt=0, decimal_places=2)
+    currency: str = Field(default="USD", pattern=r"^[A-Za-z]{3}$")
+    target_wallet: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+
+    @field_validator("currency")
+    @classmethod
+    def supported(cls, value: str) -> str:
+        try:
+            return get_currency(value).alpha
+        except UnsupportedCurrency as exc:
+            raise ValueError(str(exc))
+
+    @field_validator("amount")
+    @classmethod
+    def within_limits(cls, value: Decimal) -> Decimal:
+        # Checked here, at issue time, so a merchant learns immediately rather
+        # than after sending an unpayable link to a customer.
+        if value < settings.amount_min or value > settings.amount_max:
+            raise ValueError(
+                f"Amount must be between {settings.amount_min} and {settings.amount_max}."
+            )
+        return value
+
+
+class LinkResponse(BaseModel):
+    token: str
+    #: Absent when the link has no deadline, which is the default.
+    expires_at: Optional[datetime] = None
+
+
+class LinkSummary(BaseModel):
+    """A link as its merchant sees it — the whole row, wallet included."""
+
+    id: int
+    token: str
+    amount: Decimal
+    currency: str
+    target_wallet: str
+    active: bool
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    used_at: Optional[datetime] = None
+    payment_count: int
+    transaction_id: Optional[int] = None
+
+
+class LinkUpdate(BaseModel):
+    active: bool
+
+
+class LinkView(BaseModel):
+    """What a payer may know about a link: the amount, and nothing else.
+
+    Deliberately not the destination wallet. A cardholder must be told what
+    they are about to be charged — card scheme rules and plain fairness both
+    require it — but where the crypto goes is the merchant's business, and
+    disclosing it to whoever holds the link serves no one.
+    """
+
+    amount: Decimal
+    currency: str
+
+
+@app.post("/link", response_model=LinkResponse, status_code=201)
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def create_link(request: Request, link_req: LinkRequest):
+    """Record an order and return the token that names it."""
+    token = secrets.token_urlsafe(24)
+    # No deadline by default. A link is retired by its merchant, from the
+    # console, not by a clock they never set — an expiry nobody chose is a
+    # payment that silently stops working.
+    expires = None
+    if settings.payment_link_ttl_sec > 0:
+        expires = utcnow() + timedelta(seconds=settings.payment_link_ttl_sec)
+
+    async with async_session() as session:
+        session.add(
+            PaymentLink(
+                token=token,
+                amount=link_req.amount,
+                currency=link_req.currency,
+                target_wallet=link_req.target_wallet,
+                expires_at=expires,
+            )
+        )
+        await session.commit()
+
+    LOGGER.info(
+        f"Payment link issued for {link_req.amount} {link_req.currency}"
+        + (f", expiring {expires.isoformat()}." if expires else ", no expiry.")
+    )
+    return LinkResponse(token=token, expires_at=expires)
+
+
+@app.get("/links", response_model=List[LinkSummary])
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def list_links(request: Request):
+    """Every link this merchant has issued, newest first.
+
+    Reachable from the public origin, but deliberately not given the relay's
+    injected API key: whoever calls this must hold the key themselves. It
+    discloses destination wallets and leads to the routes below, which switch
+    links off and delete them — so the credential is the protection, and it is
+    the one thing the relay refuses to supply on a caller's behalf.
+    """
+    async with async_session() as session:
+        rows = (
+            await session.execute(select(PaymentLink).order_by(PaymentLink.id.desc()))
+        ).scalars().all()
+    return [LinkSummary.model_validate(r, from_attributes=True) for r in rows]
+
+
+@app.patch("/links/{link_id}", response_model=LinkSummary)
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def update_link(request: Request, link_id: int, change: LinkUpdate):
+    """Switch a link on or off. The row and its history are untouched."""
+    async with async_session() as session:
+        link = await session.get(PaymentLink, link_id)
+        if link is None:
+            raise HTTPException(status_code=404, detail="No such link.")
+        link.active = change.active
+        await session.commit()
+        await session.refresh(link)
+        LOGGER.info(
+            f"Payment link {link_id} turned {'on' if change.active else 'off'}."
+        )
+        return LinkSummary.model_validate(link, from_attributes=True)
+
+
+@app.delete("/links/{link_id}", status_code=204)
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def delete_link(request: Request, link_id: int):
+    """Remove a link for good.
+
+    The payments it produced are not touched: they live in `transactions`,
+    which is the record that matters. What disappears is the ability to make
+    more of them.
+    """
+    async with async_session() as session:
+        link = await session.get(PaymentLink, link_id)
+        if link is None:
+            raise HTTPException(status_code=404, detail="No such link.")
+        await session.delete(link)
+        await session.commit()
+    LOGGER.info(f"Payment link {link_id} deleted.")
+    return Response(status_code=204)
+
+
+@app.get("/link/{token}", response_model=LinkView)
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def read_link(request: Request, token: str):
+    """The amount this link will charge. Unauthenticated: the token is the key."""
+    async with async_session() as session:
+        link = (
+            await session.execute(select(PaymentLink).where(PaymentLink.token == token))
+        ).scalar_one_or_none()
+
+    # One message for absent, expired and spent alike. Distinguishing them
+    # would let anyone holding a wrong token learn whether it ever existed.
+    if link is None or not link.is_spendable():
+        raise HTTPException(status_code=404, detail="This payment link is not valid.")
+    return LinkView(amount=link.amount, currency=link.currency)
+
+
 @app.post("/pay", response_model=PaymentResponse, status_code=202)
 @limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
 async def process_payment(
@@ -601,6 +802,33 @@ async def process_payment(
             status_code=503,
             detail="Service temporarily unavailable. No funds were debited.",
         )
+
+    # ── A link, if that is how the order arrived ────────────────────────────
+    # Resolved before anything is done with the card, and resolved from the
+    # database rather than from the request: this is the step that makes the
+    # amount and the destination wallet unalterable by the payer.
+    link_row_id = None
+    if payment_req.link:
+        async with async_session() as session:
+            link = (
+                await session.execute(
+                    select(PaymentLink).where(PaymentLink.token == payment_req.link)
+                )
+            ).scalar_one_or_none()
+            if link is None or not link.is_spendable():
+                # Same answer for absent, expired and already paid. A payer who
+                # follows a dead link learns it is dead, and nothing else.
+                raise HTTPException(
+                    status_code=404, detail="This payment link is not valid."
+                )
+            link_row_id = link.id
+            payment_req = payment_req.model_copy(
+                update={
+                    "amount": Decimal(str(link.amount)),
+                    "currency": link.currency,
+                    "target_wallet": link.target_wallet,
+                }
+            )
 
     # ── Idempotency ─────────────────────────────────────────────────────────
     if idempotency_key is not None and not IDEMPOTENCY_KEY_PATTERN.match(idempotency_key):
@@ -686,6 +914,24 @@ async def process_payment(
             return _duplicate_response(existing)
         await session.refresh(transaction)
         tx_id = transaction.id
+
+        # Record the use in the same commit as the payment it belongs to, so
+        # the count can never drift from the transactions it describes. Links
+        # are reusable, so this counts rather than consumes: what stops a link
+        # is the merchant switching it off, not a payment having happened.
+        # The increment is done in SQL rather than read-modify-write, so two
+        # concurrent payments both land instead of one overwriting the other.
+        if link_row_id is not None:
+            await session.execute(
+                update(PaymentLink)
+                .where(PaymentLink.id == link_row_id)
+                .values(
+                    used_at=utcnow(),
+                    transaction_id=tx_id,
+                    payment_count=PaymentLink.payment_count + 1,
+                )
+            )
+            await session.commit()
     transaction_id_var.set(tx_id)
 
     # The worker needs the real PAN to reverse the payment if the crypto leg

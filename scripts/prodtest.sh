@@ -42,7 +42,16 @@ ENV_FILE=".env.prodtest"
 UNSEAL_KEY_FILE=".prodtest-unseal-key"
 ROOT_TOKEN_FILE=".prodtest-root-token"
 CREDENTIALS_FILE=".prodtest-credentials"
-RPC_URL="${WEB3_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}"
+# Not publicnode. It answers eth_getTransactionReceipt with null for receipts
+# more than a few days old, and a null receipt is indistinguishable from a
+# transaction that never existed. Reconciliation read that as "the transfer
+# failed" and queued reversals for eleven payments whose crypto had already
+# been delivered; only a purged PAN stopped the refunds going out. An endpoint
+# used to decide whether money moved must retain the history that proves it.
+RPC_URL="${WEB3_RPC_URL:-https://sepolia.gateway.tenderly.co}"
+# A different operator, deliberately. A backup pointing at the same provider
+# fails at the same instant as the primary and is redundancy in name only.
+RPC_URL_BACKUP="${WEB3_RPC_URL_BACKUP:-https://1rpc.io/sepolia}"
 CHAIN_ID="${WEB3_CHAIN_ID:-11155111}"
 # The ERC-20 to settle in. LINK is the obvious public choice, but its faucet
 # needs an authenticated account — one more human gate between here and a
@@ -65,6 +74,10 @@ if (( LOCAL_CHAIN )); then
     # explicitly rather than weakening the check; preflight refuses this flag.
     LOCAL_CHAIN_ENV="ALLOW_SIMULATED_CHAIN=true"
     RPC_URL="http://gateway-anvil:8545"
+    # There is only one local chain, so the backup is the same node. Leaving it
+    # pointed at a public testnet would have the worker fail over to a chain
+    # that has never heard of these transactions.
+    RPC_URL_BACKUP="http://gateway-anvil:8545"
     CHAIN_ID=31337
     # Deterministic address of the first contract Anvil's account 0 deploys.
     TOKEN="0x5FbDB2315678afecb367f032d93F642f64180aa3"
@@ -304,7 +317,7 @@ ACQUIRER_PROCESSING_CODE=000000
 ACQUIRER_SEND_CVV=true
 
 WEB3_RPC_URL=${RPC_URL}
-WEB3_RPC_URL_BACKUP=${RPC_URL}
+WEB3_RPC_URL_BACKUP=${RPC_URL_BACKUP}
 WEB3_CHAIN_ID=${CHAIN_ID}
 WEB3_CONFIRMATIONS=2
 WEB3_RECEIPT_TIMEOUT_SEC=300
@@ -332,7 +345,11 @@ WEB3_PRIVATE_KEY=
 GATEWAY_API_KEY=${API_KEY}
 CORS_ORIGINS=https://localhost
 RATE_LIMIT_PER_MINUTE=30
-TRUSTED_PROXIES=*
+# Nginx alone sits in front of the API, on the frontend network. Naming that
+# subnet rather than '*' is what makes X-Forwarded-For trustworthy: left open,
+# any client could forge the header and the per-client rate limit would be
+# keyed on a value the caller chooses.
+TRUSTED_PROXIES=10.89.3.0/24
 AMOUNT_MIN=0.01
 # Overridable so a demonstration can show a larger figure without editing the
 # script. The ceiling that matters in production is not this one — it is the
@@ -391,14 +408,30 @@ if [[ "$(podman inspect gateway-vault-prod --format '{{.State.Status}}' 2>/dev/n
     bad "Vault did not start. Check: podman logs gateway-vault-prod"
     exit 1
 fi
-# Vault needs a moment past process start before it answers the API.
-for _ in {1..20}; do
-    podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
-        vault status >/dev/null 2>&1 && break
-    podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
-        vault status 2>&1 | grep -q "Sealed" && break
+# Vault needs a moment past process start before it answers the API, and a
+# sealed Vault answers with exit status 2 — so "did it print a status block"
+# is the question, not "did the command succeed". Announcing readiness outside
+# the loop would report success even when every attempt failed, which is how a
+# transient stall turns into a confusing failure three steps later.
+# The output is captured before being examined, never piped into grep. This
+# script runs under `set -o pipefail`, and `vault status` exits 2 whenever the
+# vault is sealed — which, after any restart, is always. Piped, that exit code
+# becomes the pipeline's, so the test fails no matter what grep found.
+VAULT_READY=false
+for _ in {1..30}; do
+    VAULT_STATUS_OUT="$(podman exec -e VAULT_ADDR=http://127.0.0.1:8200 \
+        gateway-vault-prod vault status 2>&1 || true)"
+    if grep -q "Sealed" <<<"${VAULT_STATUS_OUT}"; then
+        VAULT_READY=true
+        break
+    fi
     sleep 2
 done
+if [[ "${VAULT_READY}" != "true" ]]; then
+    bad "Vault never answered its API after 60s."
+    echo "  Check: podman logs gateway-vault-prod"
+    exit 1
+fi
 ok "Vault is listening"
 
 # ── 4. Vault: init, unseal, store the key ───────────────────────────────────
@@ -411,33 +444,46 @@ VAULT_EXEC=(podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod)
 # the unseal key and the root token are kept on disk: a re-run of this script,
 # or a restart part-way through a rehearsal, then picks up where it left off
 # instead of stranding a stack nobody can authenticate against.
+# Which branch to take is decided by what is on disk, not by asking Vault.
+# The credential files are the record that this script already initialised a
+# Vault whose data volume is still here; they and that volume are created and
+# destroyed together. Sampling the API instead makes the decision hinge on one
+# reply arriving on time, and a Vault that is merely slow to wake then gets
+# treated as a fresh one — which fails, because it cannot be initialised twice.
 VAULT_REUSED=false
-if "${VAULT_EXEC[@]}" vault status 2>/dev/null | grep -q "Initialized.*true"; then
-    if [[ -r "${UNSEAL_KEY_FILE}" && -r "${ROOT_TOKEN_FILE}" ]]; then
-        UNSEAL_KEY="$(cat "${UNSEAL_KEY_FILE}")"
-        ROOT_TOKEN="$(cat "${ROOT_TOKEN_FILE}")"
-        "${VAULT_EXEC[@]}" vault operator unseal "${UNSEAL_KEY}" >/dev/null 2>&1 || true
-        if ! podman exec -e VAULT_ADDR=http://127.0.0.1:8200 -e VAULT_TOKEN="${ROOT_TOKEN}" \
-                gateway-vault-prod vault token lookup >/dev/null 2>&1; then
-            bad "Vault is initialised but the stored root token no longer opens it."
-            echo
-            echo "  Start clean with:  scripts/prodtest.sh --down"
-            exit 1
-        fi
-        VAULT_REUSED=true
-        ok "Already initialised — reusing the stored unseal key and root token"
-    else
-        bad "Vault is already initialised, from an earlier run of this script."
+if [[ -r "${UNSEAL_KEY_FILE}" && -r "${ROOT_TOKEN_FILE}" ]]; then
+    UNSEAL_KEY="$(cat "${UNSEAL_KEY_FILE}")"
+    ROOT_TOKEN="$(cat "${ROOT_TOKEN_FILE}")"
+    # A restart always comes back sealed, so unsealing is the normal path here,
+    # not the exceptional one. Retried, because the API can still be settling.
+    for _ in {1..15}; do
+        "${VAULT_EXEC[@]}" vault operator unseal "${UNSEAL_KEY}" >/dev/null 2>&1
+        podman exec -e VAULT_ADDR=http://127.0.0.1:8200 -e VAULT_TOKEN="${ROOT_TOKEN}" \
+            gateway-vault-prod vault token lookup >/dev/null 2>&1 && { VAULT_REUSED=true; break; }
+        sleep 2
+    done
+    if [[ "${VAULT_REUSED}" != "true" ]]; then
+        bad "The stored Vault credentials no longer open this Vault."
         echo
-        echo "  Its credentials are not on disk, so this run cannot take over."
-        echo "  Start clean with:"
+        echo "  Its data volume and these files disagree, which only happens if"
+        echo "  one was removed without the other. Start clean with:"
         echo
         echo "      scripts/prodtest.sh --down"
-        echo
-        echo "  That discards the rehearsal's Vault data. It is a rehearsal, so"
-        echo "  nothing of value is in there."
         exit 1
     fi
+    ok "Already initialised — reusing the stored unseal key and root token"
+elif grep -q "Initialized.*true" \
+        <<<"$("${VAULT_EXEC[@]}" vault status 2>/dev/null || true)"; then
+    bad "Vault is already initialised, from an earlier run of this script."
+    echo
+    echo "  Its credentials are not on disk, so this run cannot take over."
+    echo "  Start clean with:"
+    echo
+    echo "      scripts/prodtest.sh --down"
+    echo
+    echo "  That discards the rehearsal's Vault data. It is a rehearsal, so"
+    echo "  nothing of value is in there."
+    exit 1
 fi
 
 if [[ "${VAULT_REUSED}" == "false" ]]; then
@@ -481,8 +527,8 @@ for _ in {1..20}; do
     [[ "$(podman inspect gateway-vault-prod --format '{{.State.Status}}' 2>/dev/null)" == "running" ]] && break
     sleep 2
 done
-if podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
-        vault status 2>/dev/null | grep -q "Sealed.*true"; then
+if grep -q "Sealed.*true" <<<"$(podman exec -e VAULT_ADDR=http://127.0.0.1:8200 \
+        gateway-vault-prod vault status 2>/dev/null || true)"; then
     podman exec -e VAULT_ADDR=http://127.0.0.1:8200 gateway-vault-prod \
         vault operator unseal "${UNSEAL_KEY}" >/dev/null 2>&1
     ok "Vault unsealed again after the restart"
@@ -495,7 +541,11 @@ for _ in {1..40}; do
     sleep 3
 done
 
-READY="$(curl -sk -H "X-API-Key: ${API_KEY}" "https://localhost:${HTTPS_PORT}/health/ready")"
+# Asked of the API directly, not through Nginx. Nginx injects the API key on
+# the routes it proxies, so anything it forwarded would be readable without a
+# credential — and this endpoint names every component of the estate. It is
+# deliberately off Nginx's allowlist; see nginx.conf.
+READY="$(podman exec gateway-api-prod curl -sf -H "X-API-Key: ${API_KEY}" http://127.0.0.1:8000/health/ready)"
 echo "  readiness: ${READY}"
 
 # ── 6. A real payment ───────────────────────────────────────────────────────

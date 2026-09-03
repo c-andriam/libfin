@@ -22,6 +22,7 @@
     <span id="health" class="pill pill--idle" title="État de la passerelle">
       <span class="pill__dot"></span><span id="health-label">non vérifié</span>
     </span>
+    <a href="links.html" class="btn btn--ghost">Mes liens</a>
     <button type="button" id="settings-toggle" class="btn btn--ghost" aria-expanded="false"
             aria-controls="settings">Connexion</button>
   </div>
@@ -89,13 +90,63 @@
     </div>
 
     <button type="submit" id="submit" class="btn btn--primary">
-      <span class="btn__label">Continuer vers le paiement</span>
+      <span class="btn__label">Générer le lien de paiement</span>
     </button>
 
     <p class="disclaimer">
       Aucune donnée de carte n'est demandée à cette étape.
     </p>
   </form>
+
+  <!-- Révélé une fois la commande validée. Le lien n'est pas une navigation :
+       c'est le produit de cette page, destiné à être envoyé au payeur. -->
+  <section id="link-panel" class="panel panel--result" hidden>
+    <h2 class="panel__title">Lien de paiement</h2>
+    <p class="panel__lede">
+      Envoyez-le au payeur. Il ouvrira une page de carte pour ce montant et
+      cette adresse, sans avoir à les saisir.
+    </p>
+
+    <div class="recap">
+      <div class="recap__row">
+        <span class="recap__label">Montant</span>
+        <span class="recap__value" id="link-amount">—</span>
+      </div>
+      <div class="recap__row">
+        <span class="recap__label">Destinataire</span>
+        <span class="recap__value recap__value--mono" id="link-wallet">—</span>
+      </div>
+      <div class="recap__row">
+        <span class="recap__label">Valable jusqu'à</span>
+        <span class="recap__value" id="link-expires">—</span>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="link-url">Lien</label>
+      <input type="text" id="link-url" readonly spellcheck="false"
+             aria-describedby="link-note">
+      <p class="hint" id="link-note">
+        Le lien ne porte qu'un jeton. Le montant et l'adresse restent sur le
+        serveur : le payeur ne peut ni les lire ni les modifier.
+        <span id="link-expiry"></span>
+        Retrouvez-le dans <a href="links.html">Mes liens</a> pour le désactiver
+        ou le supprimer.
+      </p>
+    </div>
+
+    <div class="result__actions">
+      <button type="button" id="link-copy" class="btn btn--primary">
+        <span class="btn__label">Copier le lien</span>
+      </button>
+      <a id="link-open" class="btn btn--ghost" href="#" target="_blank" rel="noopener">
+        Ouvrir moi-même
+      </a>
+      <button type="button" id="link-back" class="btn btn--ghost">Modifier la commande</button>
+    </div>
+
+    <p class="status" id="link-status" role="status" hidden></p>
+  </section>
 </main>
 
 <script src="assets/js/card.js"></script>

@@ -39,6 +39,7 @@ import socketserver
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -50,11 +51,24 @@ RELAYED = (
     ("GET", re.compile(r"^/health$")),
     ("POST", re.compile(r"^/pay$")),
     ("GET", re.compile(r"^/transaction/\d+$")),
+    # Payment links. The relay adds the API key, so the payer's browser can ask
+    # what a link charges without holding a credential of its own.
+    ("POST", re.compile(r"^/link$")),
+    ("GET", re.compile(r"^/link/[A-Za-z0-9_-]{16,64}$")),
+    # The management console. Relayed, but see UNKEYED below: these are the
+    # routes that list destination wallets, switch links off and delete them.
+    ("GET", re.compile(r"^/links$")),
+    ("PATCH", re.compile(r"^/links/\d+$")),
+    ("DELETE", re.compile(r"^/links/\d+$")),
 )
 
 #: Client headers worth carrying through. Everything else — cookies above all —
 #: is dropped rather than forwarded.
-FORWARD_REQUEST_HEADERS = ("Content-Type", "Idempotency-Key", "X-Correlation-Id")
+# X-API-Key is forwarded so an operator can authenticate to the management
+# routes from the browser, where the relay deliberately supplies nothing.
+FORWARD_REQUEST_HEADERS = (
+    "Content-Type", "Idempotency-Key", "X-Correlation-Id", "X-API-Key",
+)
 FORWARD_RESPONSE_HEADERS = ("Content-Type", "X-Correlation-Id", "Retry-After")
 
 #: Longer than the gateway's own BANK_TIMEOUT_SEC so the API gets to answer
@@ -70,6 +84,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # Set by main(); None means static-only.
     gateway = None
+    #: Serve only what a payer following a link needs. Set for the origin that
+    #: faces the public; left off for the merchant's own, private one.
+    payer_only = False
     api_key = ""
     ssl_context = None
 
@@ -102,10 +119,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    #: Routes the relay forwards but never authenticates on the caller's behalf.
+    MANAGEMENT = re.compile(r"^/links(/\d+)?$")
+
+    @classmethod
+    def _is_management(cls, path):
+        return bool(cls.MANAGEMENT.match(path))
+
     def _relay(self, method):
-        """Forward one request upstream, adding the API key on the way."""
+        """Forward one request upstream, adding the API key on the way.
+
+        Except for the management routes — see the comment at the injection.
+        """
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else None
+        path = urllib.parse.urlsplit(self.path).path
 
         request = urllib.request.Request(
             self.gateway + self.path,
@@ -117,7 +145,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if value:
                 request.add_header(name, value)
         # The whole point of the relay: the key lives here, not in the browser.
-        if self.api_key:
+        # With one exception. Injecting it into the management routes would
+        # make listing, disabling and deleting links available to anyone who
+        # can reach this origin — the relay would be handing out an authority
+        # the caller never proved. For those, whatever the browser sent is
+        # forwarded unchanged, so an operator must supply the key themselves.
+        if self.api_key and not self._is_management(path):
             request.add_header("X-API-Key", self.api_key)
 
         try:
@@ -147,7 +180,35 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # ── Dispatch ────────────────────────────────────────────────────────────
 
+    #: Everything a payer following a link needs, and nothing else. The
+    #: merchant console is a separate concern served from a private origin;
+    #: hiding its buttons is not access control, and a payer who types the
+    #: bare hostname would otherwise land straight on it.
+    PAYER_PATHS = re.compile(
+        r"^/(payment\.html|result\.html|link-required\.html|favicon\.ico|assets/.+)$"
+    )
+
+    def _forbidden_for_payers(self, method):
+        if not self.payer_only:
+            return False
+        path = urllib.parse.urlsplit(self.path).path
+        if method == "GET":
+            return not (self.PAYER_PATHS.match(path) or self._relays("GET"))
+        # Minting links is the merchant's act. Left open on a public origin it
+        # is an unauthenticated money-movement API, because this relay supplies
+        # the API key that the caller does not have.
+        return path == "/link"
+
     def do_GET(self):
+        if self._forbidden_for_payers("GET"):
+            # The root of a public origin should not answer with a bare 404:
+            # it reads as an outage, and the visitor is usually someone whose
+            # link got truncated rather than someone probing. Say what is
+            # missing without disclosing that a merchant console exists here.
+            if urllib.parse.urlsplit(self.path).path == "/":
+                self.path = "/link-required.html"
+                return super().do_GET()
+            return self._json(404, {"detail": "Not found."})
         if self._relays("GET"):
             return self._relay("GET")
         super().do_GET()
@@ -157,7 +218,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self._json(405, {"detail": "Method not allowed."})
         super().do_HEAD()
 
+    def do_PATCH(self):
+        if self._relays("PATCH"):
+            return self._relay("PATCH")
+        return self._json(405, {"detail": "Method not allowed."})
+
+    def do_DELETE(self):
+        if self._relays("DELETE"):
+            return self._relay("DELETE")
+        return self._json(405, {"detail": "Method not allowed."})
+
     def do_POST(self):
+        if self._forbidden_for_payers("POST"):
+            return self._json(404, {"detail": "Not found."})
         if self._relays("POST"):
             return self._relay("POST")
         self._json(404, {"detail": "Not found."})
@@ -179,10 +252,15 @@ def main() -> int:
                         help="relay /health, /pay and /transaction to this base URL")
     parser.add_argument("--insecure", action="store_true",
                         help="skip TLS verification when relaying (self-signed simulation cert only)")
+    parser.add_argument("--payer-only", action="store_true",
+                        help="serve only the payment and confirmation pages: no link "
+                             "configuration, and no link creation. Use this for any "
+                             "origin a payer can reach.")
     args = parser.parse_args()
 
     Handler.gateway = args.gateway.rstrip("/")
     Handler.api_key = os.environ.get("GATEWAY_API_KEY", "")
+    Handler.payer_only = args.payer_only
 
     if Handler.gateway and args.insecure:
         Handler.ssl_context = ssl._create_unverified_context()
@@ -196,6 +274,8 @@ def main() -> int:
             print(f"  Racine servie  : {ROOT}")
             if Handler.gateway:
                 print(f"  Relais         : {Handler.gateway} (/health, /pay, /transaction/{{id}})")
+            if Handler.payer_only:
+                print("  Mode           : payeur — la configuration des liens n'est pas servie")
                 if Handler.api_key:
                     print("  Clé d'API      : injectée côté serveur, absente du navigateur")
                 else:

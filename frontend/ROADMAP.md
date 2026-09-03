@@ -200,9 +200,12 @@ taux de refus de l'environnement de test est mesuré avant / après.
 
 ### Travaux
 
-- Nginx sert les fichiers statiques **et** injecte la clé d'API — bloc prêt dans
-  le [README](README.md). Le frontend n'a alors plus aucune configuration :
-  ni URL, ni clé.
+- ~~Nginx sert les fichiers statiques **et** injecte la clé d'API.~~ **Fait.**
+  [nginx.conf](../nginx/nginx.conf) sert les trois pages et `/assets/`, relaie
+  `/health`, `/pay` et `/transaction/{id}` en y ajoutant `X-API-Key`, et répond
+  `404` à tout le reste — `/health/ready` compris. Le frontend n'a plus aucune
+  configuration : ni URL, ni clé. Un seul lancement : `make prod-full`.
+  Reste à faire dans cette phase : ce qui suit.
 - **Retirer le panneau « Connexion »**, seul chemin qui met une clé d'API dans
   un navigateur. Coût assumé : plus de mode deux-origines.
 - Supprimer tout usage de `serve.py` : il sert en clair et ne termine pas TLS.

@@ -919,7 +919,12 @@ async def test_a_hold_is_never_released_while_the_transfer_may_still_land():
     from gateway.models import Transaction
     from gateway.worker import _void_authorization
 
-    for onchain_status in ("success", "pending"):
+    # "unknown" belongs in this list, not outside it. It is what the chain
+    # client returns when the RPC could not be reached at all — the absence of
+    # an answer, not the answer "no". Acting on it once refunded eleven
+    # cardholders whose crypto had already been delivered; only a purged PAN
+    # stopped the money leaving.
+    for onchain_status in ("success", "pending", "unknown"):
         tx_id = await _make_transaction(
             TransactionStatus.FIAT_AUTHORIZED, 0, f"void-guard-{onchain_status}"
         )

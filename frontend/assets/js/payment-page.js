@@ -18,32 +18,93 @@
     // ── Récupération et contrôle de la commande ─────────────────────────────
     // L'URL prime : c'est elle qui décrit la page qu'on a demandée. Le
     // stockage ne sert que de repli quand l'URL ne porte rien.
-    const order = Order.fromQuery() || Order.load();
+    // Un jeton de lien de paiement, s'il y en a un. C'est désormais la forme
+    // normale : le lien ne porte que cela, et la commande vit sur le serveur.
+    const token = new URLSearchParams(window.location.search).get('l');
+    // L'ancienne forme — commande en clair dans l'URL — reste lue pour ne pas
+    // casser un lien déjà distribué, mais elle n'est plus produite.
+    const fromLink = token ? { token } : Order.fromQuery();
+    let order = token ? null : (Order.fromQuery() || Order.load());
 
-    if (!order) {
+    // Une commande arrivée par l'URL est un lien de paiement : la personne
+    // devant l'écran n'est pas celle qui l'a fabriqué. Elle n'a donc que faire
+    // du fil d'étapes, qui décrit un parcours qu'elle n'a pas suivi, ni de la
+    // marque et de l'état de la passerelle, qui renseignent l'exploitant.
+    // Retirer « Modifier » n'est pas cosmétique : ce lien renvoie le payeur
+    // vers un formulaire où il peut réécrire le montant et le destinataire.
+    if (fromLink) stripMerchantChrome();
+
+    function stripMerchantChrome() {
+      ['topbar', 'steps', 'recap-edit'].forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) node.remove();
+      });
+      // Le repli d'erreur invite à « revenir à l'étape 1 », ce qui n'a pas de
+      // sens pour un payeur : la commande n'est pas la sienne à refaire.
+      const action = document.getElementById('blocked-action');
+      if (action) action.remove();
+      document.body.classList.add('is-hosted-link');
+    }
+
+    // Aucun `return` dans cette section. Tout ce qui suit dans ce gestionnaire
+    // enregistre les écouteurs du formulaire, dont celui du bouton de paiement ;
+    // sortir ici les laisserait non branchés et le bouton resterait inerte. Ce
+    // qui décide si l'on peut payer, c'est la visibilité de #checkout, révélée
+    // par begin() — pas l'exécution de cette fonction.
+    if (token) {
+      // Le serveur dit ce que ce lien facture. Le montant est la seule chose
+      // que le payeur apprend, et la seule qu'il ait besoin de savoir : on ne
+      // demande pas à quelqu'un d'autoriser un débit dont on lui cache la
+      // somme. L'adresse de destination ne descend jamais jusqu'ici.
+      openLink(token);
+    } else if (!order) {
       UI.block("Aucune commande n'accompagne cette page. Reprenez depuis le montant.");
-      return;
+    } else {
+      begin(order);
     }
 
-    const { errors, warnings } = Order.validate(order);
-    const problems = Object.values(errors);
-    if (problems.length) {
-      UI.block(`La commande reçue est invalide : ${problems.join(' ')}`);
-      return;
+    async function openLink(value) {
+      let view;
+      try {
+        view = await Gateway.readLink(value);
+      } catch (err) {
+        // 404 couvre indifféremment inconnu, expiré et déjà payé : le serveur
+        // ne distingue pas, pour ne rien apprendre à qui essaie des jetons.
+        UI.block(err.status === 404
+          ? 'Ce lien de paiement n’est plus valable — il a expiré, a déjà servi, '
+            + 'ou n’a jamais existé. Demandez-en un nouveau à son expéditeur.'
+          : `Ce lien n’a pas pu être vérifié : ${err.message}`);
+        return;
+      }
+      order = {
+        amount: String(view.amount),
+        currency: Order.currencyLabel(view.currency),
+        // Volontairement absente. Rien sur cette page n'en a besoin : le
+        // paiement se fait au nom du jeton, et le serveur sait où livrer.
+        wallet: null,
+      };
+      begin(order);
     }
 
-    // Commande valide : on peut montrer les champs carte.
-    $('checkout').hidden = false;
-    $('recap-amount').textContent = Order.format(order);
-    const walletCell = $('recap-wallet');
-    walletCell.textContent = Address.shorten(order.wallet);
-    walletCell.title = order.wallet;
+    function begin(current) {
+      // Sans jeton, la commande est une saisie comme une autre et se valide
+      // comme telle. Avec un jeton, elle vient du serveur : la revalider ici
+      // reviendrait à faire confiance à la page pour juger sa propre source.
+      if (!token) {
+        const { errors, warnings } = Order.validate(current);
+        const problems = Object.values(errors);
+        if (problems.length) {
+          UI.block(`La commande reçue est invalide : ${problems.join(' ')}`);
+          return false;
+        }
+        if (warnings.wallet) UI.showBanner(warnings.wallet, 'warn');
+        Order.save({ ...current, createdAt: current.createdAt || new Date().toISOString() });
+      }
 
-    UI.setBusy(false, `Payer ${Order.format(order)}`);
-    if (warnings.wallet) UI.showBanner(warnings.wallet, 'warn');
-
-    // La commande venue de l'URL devient la référence pour l'étape 3.
-    Order.save({ ...order, createdAt: order.createdAt || new Date().toISOString() });
+      $('checkout').hidden = false;
+      UI.setBusy(false, `Payer ${Order.format(current)}`);
+      return true;
+    }
 
     Boot.start().then((reachable) => {
       if (!reachable) {
@@ -126,9 +187,12 @@
         pan: Card.digits(pan.value),
         expiry: Card.expiryToApi(expiry.value),
         cvv: Card.digits(cvv.value),
-        amount: order.amount,
-        currency: order.currency,
-        target_wallet: order.wallet,
+        // Avec un jeton, on n'envoie ni montant ni destinataire : les envoyer
+        // serait offrir la prise que ce mécanisme existe pour retirer. L'API
+        // refuse d'ailleurs une requête qui porte les deux.
+        ...(token
+          ? { link: token }
+          : { amount: order.amount, currency: order.currency, target_wallet: order.wallet }),
       };
 
       sending = true;
@@ -175,7 +239,14 @@
       }
 
       try {
-        window.location.assign(`result.html?tx=${encodeURIComponent(id)}`);
+        // Le marqueur voyage dans l'URL, pas dans le stockage : la page de
+        // confirmation se recharge, se met en favori et se partage, et un
+        // payeur ne doit pas se retrouver devant la configuration du marchand
+        // parce que son navigateur a vidé une clé de session.
+        const next = token
+          ? `result.html?tx=${encodeURIComponent(id)}&l=1`
+          : `result.html?tx=${encodeURIComponent(id)}`;
+        window.location.assign(next);
       } catch (err) {
         // Le paiement est parti : surtout ne pas laisser croire le contraire.
         UI.showBanner(

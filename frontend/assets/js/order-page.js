@@ -86,26 +86,100 @@
         return;
       }
 
-      // Le stockage peut être refusé (navigation privée). Ce n'est pas
-      // bloquant : la commande voyage aussi dans l'URL de l'étape 2.
-      const stored = Order.save({ ...order, createdAt: new Date().toISOString() });
-      const target = `payment.html?${Order.toQuery(order)}`;
+      // Le stockage garde la commande si l'opérateur revient la modifier. Le
+      // lien, lui, n'en dépend plus : il ne porte qu'un jeton.
+      Order.save({ ...order, createdAt: new Date().toISOString() });
+      issueLink(order);
+    });
 
+    async function issueLink(order) {
+      UI.setBusy(true, 'Création du lien…');
+      let issued;
       try {
-        window.location.assign(target);
+        issued = await Gateway.createLink(order);
       } catch (err) {
-        UI.showBanner(
-          `La redirection a échoué (${err && err.message ? err.message : 'raison inconnue'}). `
-          + 'Ouvrez la page de paiement manuellement.',
-        );
+        const view = UI.describeHttpError(err.status);
+        UI.showBanner(`${view.label} — ${err.message}`, 'error');
         return;
+      } finally {
+        UI.setBusy(false, 'Générer le lien de paiement');
       }
+      showLink(order, issued);
+    }
 
-      if (!stored) {
-        // Rien à faire de plus : l'URL porte la commande. On le dit quand même,
-        // au cas où la navigation tarderait.
-        UI.showBanner('Stockage du navigateur indisponible ; la commande voyage par l’URL.', 'warn');
+    // ── Le lien ─────────────────────────────────────────────────────────────
+    // Cette page ne conduit plus le payeur à l'étape 2 : elle fabrique une
+    // adresse qu'on lui transmet. Le marchand et le payeur sont rarement la
+    // même personne, ni sur le même appareil.
+    function paymentUrl(token) {
+      // Résolue contre l'URL courante plutôt que construite à la main : la page
+      // peut être servie depuis un sous-répertoire, et un chemin absolu codé en
+      // dur produirait un lien mort dès qu'elle l'est.
+      const url = new URL('payment.html', window.location.href);
+      // Le jeton, et rien d'autre. Le montant et l'adresse sont restés côté
+      // serveur : ils ne sont ni lisibles par qui reçoit le lien, ni
+      // modifiables par qui le paie.
+      url.search = new URLSearchParams({ l: token }).toString();
+      return url.toString();
+    }
+
+    function showLink(order, issued) {
+      const link = paymentUrl(issued.token);
+      $('link-url').value = link;
+      $('link-open').href = link;
+      $('link-amount').textContent = Order.format(order);
+      $('link-wallet').textContent = order.wallet;
+
+      // L'expiration est décidée par le serveur, pas devinée ici : une durée
+      // affichée qui ne serait pas celle appliquée tromperait le marchand sur
+      // le temps dont dispose son client.
+      const expires = issued && issued.expires_at ? new Date(issued.expires_at) : null;
+      const dated = expires && !Number.isNaN(expires.valueOf());
+      // Sans date, le lien vit jusqu'à ce qu'on le retire : le dire ainsi
+      // plutôt qu'afficher une échéance vide, qui laisserait croire à un
+      // réglage manquant.
+      $('link-expires').textContent = dated ? expires.toLocaleString() : 'jusqu’à suppression';
+      $('link-expiry').textContent = dated
+        ? `Il expire le ${expires.toLocaleString()}.`
+        : 'Il reste valable tant que vous ne le retirez pas.';
+
+      $('link-panel').hidden = false;
+      form.hidden = true;
+      UI.hideBanner();
+      setLinkStatus('');
+      $('link-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      $('link-copy').focus();
+    }
+
+    function setLinkStatus(message, tone) {
+      const node = $('link-status');
+      node.textContent = message || '';
+      node.className = tone ? `status status--${tone}` : 'status';
+      node.hidden = !message;
+    }
+
+    $('link-copy').addEventListener('click', async () => {
+      const value = $('link-url').value;
+      try {
+        // navigator.clipboard n'existe qu'en contexte sécurisé, et échoue aussi
+        // quand la permission est refusée. La sélection reste le repli qui
+        // marche partout : le lien est prêt à copier au clavier.
+        if (!navigator.clipboard) throw new Error('presse-papiers indisponible');
+        await navigator.clipboard.writeText(value);
+        setLinkStatus('Lien copié.', 'ok');
+      } catch (_) {
+        const field = $('link-url');
+        field.focus();
+        field.select();
+        setLinkStatus('Copie automatique refusée par le navigateur — le lien est sélectionné, faites Ctrl+C.', 'pending');
       }
+    });
+
+    $('link-back').addEventListener('click', () => {
+      $('link-panel').hidden = true;
+      form.hidden = false;
+      setLinkStatus('');
+      $('amount').focus();
     });
   });
 })();

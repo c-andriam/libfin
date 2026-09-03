@@ -11,7 +11,23 @@
   const { $ } = UI;
 
   document.addEventListener('DOMContentLoaded', () => {
-    const raw = new URLSearchParams(window.location.search).get('tx');
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get('tx');
+
+    // Arrivé par un lien de paiement : la personne devant l'écran est le
+    // payeur, pas le marchand. Tout ce qui mène à la configuration du 2D link
+    // doit disparaître — « Nouveau paiement » y renvoie directement, et le fil
+    // d'étapes y renvoie par son étape 1. Le payeur n'a rien à y faire : il y
+    // verrait comment les liens sont fabriqués, et pourrait s'en fabriquer.
+    if (params.get('l') === '1') stripMerchantChrome();
+
+    function stripMerchantChrome() {
+      ['topbar', 'steps', 'blocked-new', 'result-new'].forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) node.remove();
+      });
+      document.body.classList.add('is-hosted-link');
+    }
 
     if (!raw) {
       UI.block("Cette page attend un identifiant de transaction, par exemple « result.html?tx=42 ».");

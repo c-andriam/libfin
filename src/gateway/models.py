@@ -1,4 +1,5 @@
 import enum
+from typing import Optional
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, Column, DateTime, Enum, Index, Integer, Numeric, String, Text
@@ -266,6 +267,65 @@ class Transaction(Base):
     #: Retained for callers that predate the state machine.
     def mark_completed(self, status: TransactionStatus) -> None:
         self.transition_to(status, completed=True)
+
+
+class PaymentLink(Base):
+    """A payment the merchant has described, for someone else to pay.
+
+    A 2D link used to carry the order in its query string. That is readable by
+    anyone it is forwarded to, and — worse — editable: the payer could turn 300
+    into 3, or point the crypto at a wallet of their own, and the gateway would
+    have no way to know the link had ever said anything else.
+
+    So the order lives here and the link carries only ``token``. The payer's
+    browser never learns the destination wallet, and the amount it is told is
+    the amount this row holds. Nothing the payer sends can change either.
+
+    ``token`` is the credential: whoever holds it can pay this link. It is
+    generated from ``secrets`` and never derived from the row id, which would
+    make links enumerable.
+    """
+
+    __tablename__ = "payment_links"
+
+    id = Column(Integer, primary_key=True)
+    #: URL-safe, 32 bytes of entropy. Unique so a collision fails loudly at the
+    #: database rather than silently overwriting somebody's order.
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    amount = Column(Numeric(18, 2), nullable=False)
+    #: ISO 4217 alphabetic, as the merchant supplied it.
+    currency = Column(String(3), nullable=False)
+    target_wallet = Column(String(42), nullable=False)
+
+    #: NULL means no expiry: the link lives until the merchant retires it.
+    #: A date here still works, for a link deliberately given a deadline.
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    #: The merchant's switch. Turning a link off is not the same as deleting it:
+    #: the row stays, with its payment history, and can be turned back on.
+    active = Column(Boolean, nullable=False, default=True, server_default="true")
+
+    #: A link is reusable, so these describe the most recent payment rather than
+    #: the only one. The count is what tells a merchant a link is being used
+    #: more than they expected — the signal that a shared link has spread.
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    transaction_id = Column(Integer, nullable=True)
+    payment_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+    def is_spendable(self, now: Optional[datetime] = None) -> bool:
+        """Payable right now.
+
+        Three conditions, and they are checked in the order a merchant would
+        expect to reason about them: switched on, and not past a deadline if
+        one was set. Deletion is not represented here because a deleted link
+        has no row at all.
+        """
+        if not self.active:
+            return False
+        if self.expires_at is None:
+            return True
+        return self.expires_at > (now or utcnow())
 
 
 class OutboxMessage(Base):

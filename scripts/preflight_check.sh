@@ -174,9 +174,17 @@ fi
     && pass "WEB3_CONFIRMATIONS=${WEB3_CONFIRMATIONS}." \
     || block "WEB3_CONFIRMATIONS must be at least 1."
 
-[[ -n "${WEB3_RPC_URL_BACKUP:-}" ]] \
-    && pass "A backup RPC is configured." \
-    || warn "No WEB3_RPC_URL_BACKUP: a single provider outage stops all settlement."
+if [[ -z "${WEB3_RPC_URL_BACKUP:-}" ]]; then
+    warn "No WEB3_RPC_URL_BACKUP: a single provider outage stops all settlement."
+elif [[ "${WEB3_RPC_URL_BACKUP}" == "${WEB3_RPC_URL:-}" ]]; then
+    # Redundancy means a second failure domain, not a second copy of the URL.
+    # Pointed at the same host, the backup goes down at the same instant as the
+    # primary and buys nothing at all.
+    block "WEB3_RPC_URL_BACKUP is the same endpoint as WEB3_RPC_URL: it fails at
+       the same moment and provides no redundancy. Name a different provider."
+else
+    pass "A backup RPC on a different endpoint is configured."
+fi
 
 [[ -n "${WEB3_PRIVATE_KEY:-}" ]] \
     && warn "WEB3_PRIVATE_KEY is in ${ENV_FILE}. Prefer Vault at secret/gateway/web3 and leave it blank." \

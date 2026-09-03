@@ -70,6 +70,14 @@ BASE="https://localhost:${PORT}"
 
 api() { curl -sk -H "X-API-Key: ${API_KEY}" "$@"; }
 
+# Readiness is asked of the API directly, not through Nginx. Nginx now injects
+# the API key on the routes it proxies, so anything it forwarded would be
+# readable without a credential — and this endpoint names every component of
+# the estate. It is deliberately not on Nginx's allowlist; see nginx.conf.
+ready_check() {
+    podman exec gateway-api-prod curl -sf -H "X-API-Key: ${API_KEY}" http://127.0.0.1:8000/health/ready
+}
+
 db() {
     podman exec gateway-postgres-prod psql -U gateway -d gateway_db -t -A -F'|' -c "$1" 2>/dev/null
 }
@@ -78,7 +86,7 @@ db() {
 show_health() {
     step "Is the gateway ready?"
     local ready
-    ready="$(api "${BASE}/health/ready")"
+    ready="$(ready_check)"
     echo "${ready}" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)

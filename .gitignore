@@ -209,12 +209,20 @@ atlassian-ide-plugin.xml
 # .env.prod
 # .env.staging
 # .env.local
+# .env.prod is deliberately tracked as a template in this public repo,
+# so the file that actually holds secrets is this one instead.
+# .env.prod.local
 # .env.sim is deliberately NOT ignored: every value in it is fake and it is what
 # makes `make sim` work without setup.
-# !.env.sim
+!.env.sim
 # !.env.prod.example
 
-# TLS material. Certificates are generated per environment by `make certs`.
+# TLS material. Certificates are generated per environment by `make certs`,
+# or issued by scripts/certbot_issue.sh. The Let's Encrypt account key and
+# the issued private keys live under nginx/letsencrypt.
+nginx/letsencrypt/
+nginx/certbot-webroot/*
+!nginx/certbot-webroot/.gitkeep
 #nginx/ssl/
 #*.pem
 *.key
@@ -263,3 +271,5 @@ acquirer-certs/
 # Résultats de validation (suites de chaos, charge). Conservés hors /tmp.
 .validation/*.log
 .prodtest-credentials
+.certbot/
+.certbot-venv/
