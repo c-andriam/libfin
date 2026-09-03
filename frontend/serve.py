@@ -64,6 +64,11 @@ RELAYED = (
     # console. Relayed here so the development path and the Nginx path agree;
     # a route that works through one and 404s through the other is discovered
     # at the worst moment.
+    # PayMeGate's callback. Relayed so the development origin behaves like the
+    # production one; it is UNKEYED for the same reason Nginx clears the key
+    # there — the signature is what authenticates it, and handing it a key the
+    # caller never presented would make that check decorative.
+    ("POST", re.compile(r"^/webhook/paymegate$")),
     ("GET", re.compile(r"^/prestataires(/.*)?$")),
     ("POST", re.compile(r"^/prestataires(/.*)?$")),
     ("PATCH", re.compile(r"^/prestataires(/.*)?$")),
@@ -128,7 +133,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     #: Routes the relay forwards but never authenticates on the caller's behalf.
-    MANAGEMENT = re.compile(r"^/(links(/\d+)?|prestataires(/.*)?)$")
+    MANAGEMENT = re.compile(r"^/(links(/\d+)?|prestataires(/.*)?|webhook/paymegate)$")
 
     @classmethod
     def _is_management(cls, path):
