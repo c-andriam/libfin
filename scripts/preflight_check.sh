@@ -65,9 +65,20 @@ set +a
 section "Unfilled values"
 
 PLACEHOLDERS="$(grep -nE '^[A-Z_]+=.*REPLACE_ME' "${ENV_FILE}" || true)"
-# When the fiat leg is the ISO 8583 link, the PayMeGate block is inert: its
-# REPLACE_ME placeholders would otherwise block a launch that does not use it.
-if [[ "${ACQUIRER:-iso8583}" != "paymegate" ]]; then
+# Only one acquirer runs at a time, and the other one's block is inert. Blocking
+# on values the running configuration never reads would demand an ISO 8583
+# terminal id from someone who settles through a hosted checkout — and the
+# honest answer to that demand is to invent one, which teaches operators that
+# this gate can be satisfied with noise.
+#
+# The rule mirrors Settings.require_valid(), which returns as soon as the
+# PayMeGate block is satisfied: BANK_*, ACQUIRER_* and WEB3_* are never read in
+# that mode. Keep the two in step — this check exists to predict that function's
+# verdict before anything starts.
+if [[ "${ACQUIRER:-iso8583}" == "paymegate" ]]; then
+    PLACEHOLDERS="$(printf '%s\n' "${PLACEHOLDERS}" \
+        | grep -vE '^[0-9]+:(BANK_|ACQUIRER_|WEB3_)' || true)"
+else
     PLACEHOLDERS="$(printf '%s\n' "${PLACEHOLDERS}" | grep -vE '^[0-9]+:PAYMEGATE_' || true)"
 fi
 if [[ -n "${PLACEHOLDERS}" ]]; then
@@ -434,14 +445,50 @@ else
     info "gateway-prod-backend does not exist yet; it will be created internal."
 fi
 
-# Vault with mlock disabled may be swapped to disk.
+# Vault with mlock disabled may be swapped to disk. The question is not whether
+# swap exists but whether it is *persistent*: zram is a compressed device that
+# lives in RAM and writes nowhere, so a page swapped into it is no more exposed
+# than a page that stayed put. Treating any swap as dangerous flags a safe host
+# and teaches operators to wave the check through — which costs more than the
+# check saves. What matters is disk-backed swap, and zram configured with a
+# writeback device, which spills to disk under pressure.
 if [[ "${VAULT_DISABLE_MLOCK:-true}" == "true" ]]; then
-    if command -v swapon >/dev/null 2>&1 && [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
-        warn "VAULT_DISABLE_MLOCK=true and this host has swap enabled: Vault's memory, \
-including the hot wallet key, can be written to disk. Disable or encrypt swap, or run \
-rootful with VAULT_DISABLE_MLOCK=false."
+    PERSISTENT_SWAP=""
+    while read -r dev _; do
+        [[ -z "${dev}" || "${dev}" == "Filename" ]] && continue
+        if [[ "${dev}" == /dev/zram* ]]; then
+            backing="$(cat "/sys/block/${dev##*/}/backing_dev" 2>/dev/null || echo none)"
+            [[ "${backing}" == "none" ]] && continue
+            PERSISTENT_SWAP="${PERSISTENT_SWAP} ${dev}(writeback:${backing})"
+        else
+            PERSISTENT_SWAP="${PERSISTENT_SWAP} ${dev}"
+        fi
+    done < <(tail -n +2 /proc/swaps 2>/dev/null)
+
+    if [[ -n "${PERSISTENT_SWAP}" ]]; then
+        # A blocker, not a warning. What sits in that memory is the key that
+        # signs transfers: swapped to disk it outlives the process, survives a
+        # reboot, and is readable by anyone who later gets the disk. A warning
+        # invites someone to note it and carry on, which is the wrong answer
+        # for a credential that can move money.
+        # A blocker, not a warning. What sits in that memory is the key that
+        # signs transfers: written to disk it outlives the process, survives a
+        # reboot, and is readable by anyone who later gets the disk.
+        block "VAULT_DISABLE_MLOCK=true and this host has disk-backed swap \
+(${PERSISTENT_SWAP# }): Vault's memory, including the hot wallet key, can be written to \
+disk and survive the process. Turn that swap off, encrypt it, or run Vault rootful with \
+VAULT_DISABLE_MLOCK=false."
     else
-        pass "Vault memory locking is off, but the host has no swap."
+        pass "Vault memory locking is off, but no swap on this host reaches a disk."
+    fi
+
+    # Hibernation dumps all of RAM to disk, mlock or not — a separate path to
+    # the same exposure, and one that swap checks alone never catch.
+    RESUME_DEV="$(cat /sys/power/resume 2>/dev/null || echo 0:0)"
+    if [[ -n "${RESUME_DEV}" && "${RESUME_DEV}" != "0:0" ]]; then
+        block "Hibernation is configured (resume device ${RESUME_DEV}): suspending writes \
+the whole of RAM to disk, hot wallet key included. Disable hibernation on a host that \
+holds signing keys."
     fi
 fi
 
