@@ -199,6 +199,12 @@ class Settings:
         ).strip()
         #: Where the customer returns after paying on the hosted checkout.
         self.paymegate_return_url: str = _env("PAYMEGATE_RETURN_URL")
+        #: Destination wallet recorded for checkout-page orders. In PayMeGate
+        #: mode settlement always goes to the wallet configured on PayMeGate
+        #: itself; this is kept on the row for traceability. A valid 0x address.
+        self.checkout_target_wallet: str = _env(
+            "CHECKOUT_TARGET_WALLET", "0x0000000000000000000000000000000000000000"
+        )
 
         # ── Web3 ────────────────────────────────────────────────────────────
         rpc_urls = [
