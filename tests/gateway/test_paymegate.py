@@ -263,3 +263,82 @@ def test_verify_webhook_signature_constant_time():
     assert verify_webhook_signature(body, None, secret=SECRET, timestamp_header=timestamp) is False
     assert verify_webhook_signature(body, signature, secret=SECRET, timestamp_header=None) is False
     assert verify_webhook_signature(body, signature, secret="", timestamp_header=timestamp) is False
+
+
+# ---------------------------------------------------------------------------
+# Public checkout page (GET /checkout + POST /checkout/pay)
+# ---------------------------------------------------------------------------
+
+
+async def _fake_paymegate(monkeypatch):
+    """Stub the PayMeGate client and switch the acquirer to PayMeGate mode."""
+    order_uuid = str(uuid.uuid4())
+    checkout_url = f"https://www.paymegate.com/pay/{order_uuid}"
+
+    async def fake_create_order(**kwargs):
+        return {
+            "orderUUID": order_uuid,
+            "checkoutUrl": checkout_url,
+            "status": "UNPAID",
+            "amount": kwargs["amount"],
+            "currency": kwargs["currency"],
+        }
+
+    from gateway import api
+
+    monkeypatch.setattr(api.settings, "acquirer", "paymegate")
+
+    class _FakeClient:
+        create_order = staticmethod(fake_create_order)
+
+        async def get_order(self, order_uuid):
+            return {"orderUUID": order_uuid, "status": "PAID"}
+
+    monkeypatch.setattr(api, "PayMeGateClient", _FakeClient)
+    return order_uuid, checkout_url
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_checkout_page_is_served_publicly(gateway_client):
+    # Public (no API key): the page is meant to be opened by a payer's browser.
+    response = await gateway_client.get("/checkout")
+    assert response.status_code == 200, response.text
+    assert "text/html" in response.headers["content-type"]
+    assert "Paiement" in response.text
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_checkout_pay_returns_checkout_url(gateway_client, monkeypatch):
+    order_uuid, checkout_url = await _fake_paymegate(monkeypatch)
+
+    response = await gateway_client.post(
+        "/checkout/pay", json={"amount": "25.00", "currency": "USD"}
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["checkout_url"] == checkout_url
+    assert body["order_uuid"] == order_uuid
+    assert body["status"] == "PENDING"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_checkout_pay_rejects_invalid_amount(gateway_client, monkeypatch):
+    await _fake_paymegate(monkeypatch)
+
+    # Zero/negative is refused by the model.
+    response = await gateway_client.post(
+        "/checkout/pay", json={"amount": "0.00", "currency": "USD"}
+    )
+    assert response.status_code == 422, response.text
+
+    # Above AMOUNT_MAX is refused by the model.
+    response = await gateway_client.post(
+        "/checkout/pay", json={"amount": "999999.00", "currency": "USD"}
+    )
+    assert response.status_code == 422, response.text
+
+    # An unsupported currency is refused too.
+    response = await gateway_client.post(
+        "/checkout/pay", json={"amount": "25.00", "currency": "XXX"}
+    )
+    assert response.status_code == 422, response.text

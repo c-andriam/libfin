@@ -1,0 +1,47 @@
+# ============================================================================
+#  systemd unit for the libfin gateway in PayMeGate mode (Voie B / VPS 24/7).
+#
+#  Runs scripts/run_paymegate_local.py, which reads the gitignored .env at the
+#  repo root for the real PayMeGate credentials. Restarts on crash and on boot,
+#  so the gateway is up without anyone touching the machine.
+#
+#  Install on the VPS:
+#      install -m 644 deploy/libfin-gateway.service /etc/systemd/system/
+#      systemctl daemon-reload
+#      systemctl enable --now libfin-gateway
+#
+#  Adjust User=, WorkingDirectory= and ExecStart if the repo lives elsewhere.
+# ============================================================================
+
+[Unit]
+Description=libfin gateway (PayMeGate hosted checkout)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as an unprivileged user. Create it if absent:
+#   useradd -r -m -s /usr/sbin/nologin libfin
+User=libfin
+Group=libfin
+WorkingDirectory=/opt/libfin
+# Reads .env from WorkingDirectory via run_paymegate_local.py.
+ExecStart=/opt/libfin/.venv/bin/python /opt/libfin/scripts/run_paymegate_local.py --port 8100 --database /var/lib/libfin/gateway.db
+Restart=always
+RestartSec=3
+# Graceful stop for in-flight payments/webhooks.
+TimeoutStopSec=15
+
+# Writable state (SQLite) under a systemd-managed directory:
+#   state-directory-v0=libfin  →  /var/lib/libfin, owned by libfin.
+StateDirectory=libfin
+StateDirectoryMode=0750
+
+# Basic hardening (best effort; harmless if a directive is unsupported).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

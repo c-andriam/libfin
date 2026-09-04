@@ -7,6 +7,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -165,14 +166,18 @@ app.add_middleware(
 app.include_router(prestataires_router)
 
 #: Endpoints reachable without an API key. Deliberately short.
-#:
-#: The PayMeGate webhook belongs here for a reason that is easy to get backwards:
-#: it is not unauthenticated, it is authenticated *differently*. PayMeGate signs
-#: each delivery with the shared webhook secret and has no way to know our API
-#: key, so demanding the key would reject every genuine callback — and since the
-#: webhook is the only channel by which a payment's outcome ever arrives, the
-#: whole integration would sit silent with nothing in the logs to explain it.
-PUBLIC_PATHS = {"/health", "/webhook/paymegate"}
+#: The PayMeGate webhook is excluded from the gateway API-key scheme because
+#: PayMeGate delivers with its own signed headers (X-Paymegate-Signature, etc.)
+#: and not our X-API-Key — it is authenticated by the HMAC signature check
+#: inside the handler instead. The ISO 8583 host has no equivalent endpoint.
+PUBLIC_PATHS = {
+    "/health",
+    "/health/ready",
+    "/webhook/paymegate",
+    "/checkout",
+    "/checkout/pay",
+    "/checkout.js",
+}
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
 
@@ -1096,6 +1101,77 @@ async def process_payment(
         fiat_amount=payment_req.amount,
         stan=stan,
     )
+
+
+class CheckoutRequest(BaseModel):
+    """Amount and currency chosen on the public checkout page.
+
+    There is no card data here: in PayMeGate mode the customer pays on the
+    hosted checkout, so this page merely names what is to be paid.
+    """
+
+    amount: Decimal = Field(..., gt=0, decimal_places=2)
+    currency: str = Field(default="USD", pattern=r"^[A-Za-z]{3}$")
+
+    @field_validator("currency")
+    @classmethod
+    def supported(cls, value: str) -> str:
+        try:
+            return get_currency(value).alpha
+        except UnsupportedCurrency as exc:
+            raise ValueError(str(exc))
+
+    @field_validator("amount")
+    @classmethod
+    def within_limits(cls, value: Decimal) -> Decimal:
+        if value > settings.amount_max:
+            raise ValueError(f"amount must be at most {settings.amount_max}")
+        return value
+
+
+#: Served to browsers on the public checkout page. The card is processed by
+#: PayMeGate; a Luhn-valid placeholder keeps the shared PaymentRequest model
+#: happy while remaining clearly synthetic (never sent to the acquirer).
+_PLACEHOLDER_PAN = "4111111111111111"
+
+
+@app.get("/checkout")
+async def checkout_page():
+    """Public, single-page UI: pick an amount, pay on PayMeGate's checkout."""
+    path = Path(__file__).resolve().parent.parent.parent / "frontend" / "checkout.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Checkout page not found.")
+    return Response(content=path.read_text(encoding="utf-8"), media_type="text/html")
+
+
+@app.get("/checkout.js")
+async def checkout_script():
+    """Public JS for the checkout page (external so the CSP stays strict)."""
+    path = Path(__file__).resolve().parent.parent.parent / "frontend" / "assets" / "js" / "checkout.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Checkout script not found.")
+    return Response(
+        content=path.read_text(encoding="utf-8"), media_type="text/javascript"
+    )
+
+
+@app.post("/checkout/pay", response_model=PaymentResponse, status_code=202)
+@limiter.limit(lambda: f"{settings.rate_limit_per_minute}/minute")
+async def checkout_pay(request: Request, req: CheckoutRequest):
+    """Create a PayMeGate order for the amount chosen on the checkout page.
+
+    The destination wallet is taken from configuration, so nothing the visitor
+    sends can redirect where the crypto goes. Rate-limited and amount-bounded.
+    """
+    payment_req = PaymentRequest(
+        pan=_PLACEHOLDER_PAN,
+        expiry="4912",
+        cvv="123",
+        target_wallet=settings.checkout_target_wallet,
+        amount=req.amount,
+        currency=req.currency,
+    )
+    return await _process_paymegate_order(request, payment_req, None)
 
 
 @app.get("/transaction/{tx_id}")

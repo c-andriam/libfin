@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>libfin — Paiement</title>
+  <style>
+    :root { --brand:#1a1a2e; --accent:#e94560; --bg:#f5f6fa; --card:#fff; --text:#222; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text);
+           display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px; }
+    .card { background:var(--card); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.08);
+            width:100%; max-width:420px; padding:32px; }
+    .brand { display:flex; align-items:center; gap:8px; margin-bottom:24px; color:var(--brand); font-weight:700; }
+    .brand .mark { width:12px; height:12px; border-radius:50%; background:var(--accent); display:inline-block; }
+    h1 { font-size:22px; margin:0 0 6px; }
+    p.lede { color:#666; margin:0 0 24px; font-size:14px; }
+    label { display:block; font-size:13px; font-weight:600; margin:14px 0 6px; }
+    .row { display:flex; gap:12px; }
+    .row .g { flex:1; }
+    input, select { width:100%; padding:12px; border:1px solid #ddd; border-radius:8px; font-size:16px; }
+    input:focus, select:focus { outline:2px solid var(--accent); border-color:transparent; }
+    .err { color:var(--accent); font-size:13px; min-height:18px; margin-top:6px; }
+    button { width:100%; margin-top:18px; padding:14px; background:var(--accent); color:#fff; border:0;
+             border-radius:8px; font-size:16px; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:wait; }
+    .disclaimer { font-size:12px; color:#999; margin-top:16px; line-height:1.5; }
+    .hidden { display:none; }
+    .ok { color:#2e7d32; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand"><span class="mark"></span> libfin · paiement sécurisé</div>
+    <h1>Paiement</h1>
+    <p class="lede">Choisissez un montant. Vous serez redirigé vers la page de paiement sécurisée.</p>
+
+    <div class="row">
+      <div class="g">
+        <label for="amount">Montant</label>
+        <input type="text" id="amount" inputmode="decimal" placeholder="25.00" autocomplete="off" spellcheck="false">
+        <p class="err" id="amount-err"></p>
+      </div>
+      <div class="g">
+        <label for="currency">Devise</label>
+        <select id="currency">
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="pay" type="button">Payer</button>
+    <p class="err"><span id="form-err"></span></p>
+    <p class="ok hidden" id="ok-msg"></p>
+    <p class="disclaimer">
+      Le paiement est traité par PayMeGate : vos données de carte ne transitent
+      jamais par cette page. Les fonds (en crypto) sont remis au destinataire.
+    </p>
+  </div>
+
+  <script src="checkout.js"></script>
+</body>
+</html>
