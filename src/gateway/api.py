@@ -165,7 +165,11 @@ app.add_middleware(
 app.include_router(prestataires_router)
 
 #: Endpoints reachable without an API key. Deliberately short.
-PUBLIC_PATHS = {"/health"}
+#: The PayMeGate webhook is excluded from the gateway API-key scheme because
+#: PayMeGate delivers with its own signed headers (X-Paymegate-Signature, etc.)
+#: and not our X-API-Key — it is authenticated by the HMAC signature check
+#: inside the handler instead. The ISO 8583 host has no equivalent endpoint.
+PUBLIC_PATHS = {"/health", "/webhook/paymegate"}
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
 
