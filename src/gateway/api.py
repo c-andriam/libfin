@@ -176,6 +176,7 @@ PUBLIC_PATHS = {
     "/webhook/paymegate",
     "/checkout",
     "/checkout/pay",
+    "/checkout.js",
 }
 if settings.docs_enabled:
     PUBLIC_PATHS |= {"/docs", "/redoc", "/openapi.json"}
@@ -1110,6 +1111,17 @@ async def checkout_page():
     if not path.exists():
         raise HTTPException(status_code=404, detail="Checkout page not found.")
     return Response(content=path.read_text(encoding="utf-8"), media_type="text/html")
+
+
+@app.get("/checkout.js")
+async def checkout_script():
+    """Public JS for the checkout page (external so the CSP stays strict)."""
+    path = Path(__file__).resolve().parent.parent.parent / "frontend" / "assets" / "js" / "checkout.js"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Checkout script not found.")
+    return Response(
+        content=path.read_text(encoding="utf-8"), media_type="text/javascript"
+    )
 
 
 @app.post("/checkout/pay", response_model=PaymentResponse, status_code=202)
