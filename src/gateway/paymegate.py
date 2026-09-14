@@ -29,6 +29,7 @@ Key properties
 
 from __future__ import annotations
 
+import ast
 import base64
 import hmac
 import logging
@@ -40,6 +41,29 @@ import httpx
 from gateway.config import settings
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _parse_payment_methods(raw: str | None) -> list[str]:
+    """Parse the configured payment methods into a list of method keys.
+
+    Accepts either a single key (``"stripe"``), a comma-separated list
+    (``"stripe,paypal"``), or a JSON-style list string (``"['stripe']"`` /
+    ``"[\"stripe\"]"``). Falls back to ``["*"]`` (all methods) when empty or
+    when the wildcard is given.
+    """
+    value = (raw or "").strip()
+    if not value or value == "*":
+        return ["*"]
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            parsed = ast.literal_eval(value)
+            keys = [m.strip() for m in parsed if str(m).strip()]
+        except (ValueError, SyntaxError):
+            key = value[1:-1].strip().strip("\"'")
+            keys = [m.strip().strip("\"'") for m in key.split(",") if m.strip()]
+    else:
+        keys = [m.strip() for m in value.split(",") if m.strip()]
+    return keys or ["*"]
 
 
 class PayMeGateError(RuntimeError):
@@ -76,6 +100,7 @@ class PayMeGateClient:
                 "Content-Type": "application/json",
             },
             timeout=self._timeout,
+            verify=settings.paymegate_ssl_verify,
         )
 
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
@@ -114,10 +139,7 @@ class PayMeGateClient:
         The returned ``checkoutUrl`` is the only URL to share with the customer.
         """
         methods = payment_methods or settings.paymegate_payment_methods or "*"
-        methods_key = methods.strip().strip("[]")
-        methods_list = [
-            m.strip() for m in methods_key.split(",") if m.strip()
-        ] or ["*"]
+        methods_list = _parse_payment_methods(methods)
 
         body: dict = {
             "amount": f"{amount:.2f}",

@@ -171,6 +171,7 @@ app.include_router(prestataires_router)
 #: and not our X-API-Key — it is authenticated by the HMAC signature check
 #: inside the handler instead. The ISO 8583 host has no equivalent endpoint.
 PUBLIC_PATHS = {
+    "/",
     "/health",
     "/health/ready",
     "/webhook/paymegate",
@@ -1133,6 +1134,21 @@ class CheckoutRequest(BaseModel):
 #: PayMeGate; a Luhn-valid placeholder keeps the shared PaymentRequest model
 #: happy while remaining clearly synthetic (never sent to the acquirer).
 _PLACEHOLDER_PAN = "4111111111111111"
+
+
+@app.get("/")
+async def root():
+    """Public landing: route visitors straight to the checkout page."""
+    return Response(
+        content=(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta http-equiv=\"refresh\" content=\"0;url=/checkout\">"
+            "<title>Payment gateway</title></head><body>"
+            "<p>Redirecting to the checkout page — "
+            "<a href=\"/checkout\">continue</a>.</p></body></html>"
+        ),
+        media_type="text/html",
+    )
 
 
 @app.get("/checkout")

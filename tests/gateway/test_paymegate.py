@@ -22,6 +22,7 @@ import uuid
 import pytest
 
 from gateway.models import TransactionStatus
+from gateway.paymegate import _parse_payment_methods
 
 APPROVED_PAN = "4111111111111111"
 WALLET = "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
@@ -308,6 +309,15 @@ async def test_checkout_page_is_served_publicly(gateway_client):
 
 
 @pytest.mark.asyncio(loop_scope="function")
+async def test_root_is_public_and_redirects_to_checkout(gateway_client):
+    # The root must not require an API key (a payer's browser may land here
+    # via the PayMeGate returnUrl). It redirects to the checkout page.
+    response = await gateway_client.get("/")
+    assert response.status_code == 200, response.text
+    assert "/checkout" in response.text
+
+
+@pytest.mark.asyncio(loop_scope="function")
 async def test_checkout_pay_returns_checkout_url(gateway_client, monkeypatch):
     order_uuid, checkout_url = await _fake_paymegate(monkeypatch)
 
@@ -342,3 +352,21 @@ async def test_checkout_pay_rejects_invalid_amount(gateway_client, monkeypatch):
         "/checkout/pay", json={"amount": "25.00", "currency": "XXX"}
     )
     assert response.status_code == 422, response.text
+
+
+def test_parse_payment_methods():
+    # The wildcard and empty/None fall back to all methods.
+    assert _parse_payment_methods("*") == ["*"]
+    assert _parse_payment_methods(None) == ["*"]
+    assert _parse_payment_methods("") == ["*"]
+
+    # A plain comma-separated string.
+    assert _parse_payment_methods("stripe,paypal") == ["stripe", "paypal"]
+
+    # JSON-style list forms (the .env uses ["stripe"]).
+    assert _parse_payment_methods('["stripe"]') == ["stripe"]
+    assert _parse_payment_methods("['stripe']") == ["stripe"]
+    assert _parse_payment_methods('["stripe", "paypal"]') == [
+        "stripe",
+        "paypal",
+    ]

@@ -199,6 +199,13 @@ class Settings:
         ).strip()
         #: Where the customer returns after paying on the hosted checkout.
         self.paymegate_return_url: str = _env("PAYMEGATE_RETURN_URL")
+        #: Disable TLS certificate verification when calling the PayMeGate API.
+        #: Some environments (Windows + antivirus TLS inspection, corporate
+        #: proxies) fail to validate the chain. Set to "false" to trust the
+        #: wire as-is. Only do this for local/testing setups, never in prod.
+        self.paymegate_ssl_verify: bool = _env(
+            "PAYMEGATE_SSL_VERIFY", "true"
+        ).strip().lower() not in {"false", "0", "no", "off"}
         #: Destination wallet recorded for checkout-page orders. In PayMeGate
         #: mode settlement always goes to the wallet configured on PayMeGate
         #: itself; this is kept on the row for traceability. A valid 0x address.
