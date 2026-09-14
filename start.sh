@@ -19,7 +19,7 @@ set -euo pipefail
 
 PORT="${PORT:-8100}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CF="${CLOUDFLARED:-$HOME/.local/cloudflared/usr/bin/cloudflared}"
+CF="${CLOUDFLARED:-$(command -v cloudflared 2>/dev/null || echo "$HOME/.local/cloudflared/usr/bin/cloudflared")}"
 
 cd "$REPO"
 
