@@ -100,6 +100,7 @@ class PayMeGateClient:
                 "Content-Type": "application/json",
             },
             timeout=self._timeout,
+            verify=settings.paymegate_ssl_verify,
         )
 
     async def _request(self, method: str, path: str, json: dict | None = None) -> dict:
